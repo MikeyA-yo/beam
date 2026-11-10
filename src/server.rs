@@ -1,24 +1,29 @@
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use rust_embed::Embed;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::TcpListener;
 
-use crate::{auth, socket};
+use crate::{auth, socket, upload};
 
 /// How many ports to try, starting from the requested one.
 pub const PORT_ATTEMPTS: u16 = 10;
+
+/// After Ctrl+C, how long transfers in progress get to finish. Anything
+/// still running is then dropped, and its `.part` file is deleted.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Embed)]
 #[folder = "web/"]
@@ -81,6 +86,12 @@ pub async fn bind_on(ip: Ipv4Addr, port: u16) -> Result<TcpListener, BindError> 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        // axum's default 2 MB body limit would cut off any real upload.
+        // The upload handler streams to disk, so lifting it costs no memory.
+        .route(
+            "/api/upload",
+            post(upload::handle).layer(DefaultBodyLimit::disable()),
+        )
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -89,18 +100,36 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Serves until `shutdown` resolves.
+/// Serves until `shutdown` resolves, then gives transfers in progress
+/// [`SHUTDOWN_GRACE`] to finish.
 pub async fn serve(
     listener: TcpListener,
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    axum::serve(
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await
+    .with_graceful_shutdown(async {
+        let _ = stop_rx.await;
+    })
+    .into_future();
+    let mut server = std::pin::pin!(server);
+
+    tokio::select! {
+        result = &mut server => return result,
+        () = shutdown => {}
+    }
+    let _ = stop_tx.send(());
+    match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::info!("Stopping without waiting for unfinished transfers.");
+            Ok(())
+        }
+    }
 }
 
 #[derive(Deserialize)]

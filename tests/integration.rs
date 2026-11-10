@@ -1,15 +1,20 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use beam::server::{self, AppState};
 use reqwest::StatusCode;
-use reqwest::header::{COOKIE, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use tempfile::TempDir;
+
+const BOUNDARY: &str = "beam-test-boundary-7MA4YWxkTrZu0gW";
 
 struct TestServer {
     base: String,
+    addr: SocketAddr,
     token: String,
     client: reqwest::Client,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 impl TestServer {
@@ -33,9 +38,10 @@ impl TestServer {
             .unwrap();
         Self {
             base: format!("http://{addr}"),
+            addr,
             token,
             client,
-            _dir: dir,
+            dir,
         }
     }
 
@@ -46,7 +52,83 @@ impl TestServer {
     fn cookie(&self) -> String {
         format!("beam_session={}", self.token)
     }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Sorted names of everything in the shared folder.
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(self.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn post_upload(&self, body: impl Into<reqwest::Body>) -> reqwest::RequestBuilder {
+        self.client
+            .post(self.url("/api/upload"))
+            .header(COOKIE, self.cookie())
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(body)
+    }
+
+    async fn upload(&self, files: &[(&str, &[u8])]) -> reqwest::Response {
+        self.post_upload(multipart_body(files))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Uploads one file and returns the name the server saved it under.
+    async fn upload_one(&self, name: &str, data: &[u8]) -> String {
+        let res = self.upload(&[(name, data)]).await;
+        assert_eq!(res.status(), StatusCode::OK, "upload of {name:?} failed");
+        let json: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+        assert_eq!(json["files"][0]["size"].as_u64(), Some(data.len() as u64));
+        json["files"][0]["name"].as_str().unwrap().to_owned()
+    }
 }
+
+/// Multipart is built by hand rather than with reqwest's builder, so tests
+/// control exactly which filename bytes reach the server, the way a hostile
+/// client would.
+fn part_header(name: &str) -> String {
+    format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n"
+    )
+}
+
+fn multipart_body(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (name, data) in files {
+        body.extend_from_slice(part_header(name).as_bytes());
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// Polls until `check` passes or `timeout` runs out.
+async fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    check()
+}
+
+// ---- Auth (M1) ----
 
 #[tokio::test]
 async fn page_without_cookie_asks_to_rescan() {
@@ -167,4 +249,217 @@ async fn busy_port_falls_back_to_next() {
     let listener = server::bind_on(Ipv4Addr::LOCALHOST, busy).await.unwrap();
     let got = listener.local_addr().unwrap().port();
     assert!(got > busy && got < busy + server::PORT_ATTEMPTS);
+}
+
+// ---- Uploads (M2) ----
+
+#[tokio::test]
+async fn upload_without_cookie_is_rejected() {
+    let s = TestServer::start().await;
+    let res = s
+        .client
+        .post(s.url("/api/upload"))
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(multipart_body(&[("a.txt", b"x")]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(s.files().is_empty());
+}
+
+#[tokio::test]
+async fn upload_lands_with_the_right_content() {
+    let s = TestServer::start().await;
+    let data = b"hello from the phone\n\x00\xff binary too";
+    assert_eq!(s.upload_one("hello.txt", data).await, "hello.txt");
+    assert_eq!(std::fs::read(s.path().join("hello.txt")).unwrap(), data);
+    assert_eq!(s.files(), ["hello.txt"], "no .part file may remain");
+}
+
+#[tokio::test]
+async fn several_files_in_one_request() {
+    let s = TestServer::start().await;
+    let res = s.upload(&[("one.txt", b"1"), ("two.txt", b"22")]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(s.files(), ["one.txt", "two.txt"]);
+    assert_eq!(std::fs::read(s.path().join("two.txt")).unwrap(), b"22");
+}
+
+#[tokio::test]
+async fn collisions_get_numbered_and_nothing_is_overwritten() {
+    let s = TestServer::start().await;
+    assert_eq!(s.upload_one("photo.jpg", b"first").await, "photo.jpg");
+    assert_eq!(s.upload_one("photo.jpg", b"second").await, "photo (1).jpg");
+    assert_eq!(s.upload_one("photo.jpg", b"third").await, "photo (2).jpg");
+    assert_eq!(std::fs::read(s.path().join("photo.jpg")).unwrap(), b"first");
+    assert_eq!(
+        std::fs::read(s.path().join("photo (1).jpg")).unwrap(),
+        b"second"
+    );
+    assert_eq!(
+        std::fs::read(s.path().join("photo (2).jpg")).unwrap(),
+        b"third"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_uploads_of_the_same_name_all_survive() {
+    let s = TestServer::start().await;
+    let bodies: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 64 * 1024]).collect();
+    let uploads = bodies.iter().map(|b| s.upload_one("same.bin", b));
+    let mut names = futures::future::join_all(uploads).await;
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 8, "every upload needs its own name: {names:?}");
+    // Each body is one repeated byte, so every original must be on disk intact.
+    let mut found: Vec<u8> = names
+        .iter()
+        .map(|n| {
+            let data = std::fs::read(s.path().join(n)).unwrap();
+            assert_eq!(data.len(), 64 * 1024);
+            assert!(data.iter().all(|&b| b == data[0]));
+            data[0]
+        })
+        .collect();
+    found.sort();
+    assert_eq!(found, (0..8u8).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn traversal_names_stay_inside_the_folder() {
+    let s = TestServer::start().await;
+    let outside: PathBuf = s.path().parent().unwrap().join("evil.txt");
+    let existed_before = outside.exists();
+
+    assert_eq!(s.upload_one("../../evil.txt", b"x").await, "evil.txt");
+    let saved = s.upload_one(r"..\..\evil.txt", b"y").await;
+    assert!(
+        saved.ends_with(".txt") && !saved.contains(['/', '\\']),
+        "{saved:?}"
+    );
+    assert_eq!(s.upload_one("/etc/passwd", b"z").await, "passwd");
+
+    assert_eq!(
+        outside.exists(),
+        existed_before,
+        "nothing may be written outside"
+    );
+    assert_eq!(s.files().len(), 3);
+    for name in s.files() {
+        assert!(s.path().join(&name).is_file());
+    }
+}
+
+#[tokio::test]
+async fn reserved_and_forbidden_names_are_made_safe() {
+    let s = TestServer::start().await;
+    assert_eq!(s.upload_one("CON.txt", b"x").await, "_CON.txt");
+    assert_eq!(s.upload_one("nul", b"x").await, "_nul");
+    assert_eq!(s.upload_one("a<b>c|d?e*.txt", b"x").await, "abcde.txt");
+    assert_eq!(
+        s.upload_one("notes.txt:stream", b"x").await,
+        "notes.txtstream"
+    );
+    assert_eq!(s.upload_one("trailing. . .", b"x").await, "trailing");
+    let fallback = s.upload_one("..", b"x").await;
+    assert!(fallback.starts_with("file-"), "{fallback:?}");
+}
+
+#[tokio::test]
+async fn unicode_names_survive_the_round_trip() {
+    let s = TestServer::start().await;
+    for name in ["фото 📷.jpg", "日本語.txt", "café.mp3"] {
+        assert_eq!(s.upload_one(name, b"x").await, name);
+        assert!(s.path().join(name).is_file());
+    }
+}
+
+#[tokio::test]
+async fn uploads_above_the_default_2mb_body_limit_work() {
+    let s = TestServer::start().await;
+    let data: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(s.upload_one("big.bin", &data).await, "big.bin");
+    assert_eq!(std::fs::read(s.path().join("big.bin")).unwrap(), data);
+}
+
+#[tokio::test]
+async fn request_without_files_is_a_bad_request() {
+    let s = TestServer::start().await;
+    let body = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--{BOUNDARY}--\r\n"
+    );
+    let res = s.post_upload(body).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(res.text().await.unwrap().contains("no files"));
+    assert!(s.files().is_empty());
+}
+
+/// The client vanishes halfway through. The temp file must exist during the
+/// upload, which proves the test got that far, and be gone afterwards.
+#[tokio::test]
+async fn interrupted_upload_leaves_no_file_behind() {
+    use tokio::io::AsyncWriteExt;
+
+    let s = TestServer::start().await;
+    let mut sock = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    let head = format!(
+        "POST /api/upload HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\n\
+         Content-Type: multipart/form-data; boundary={BOUNDARY}\r\n\
+         Content-Length: 100000000\r\n\r\n{}",
+        s.addr,
+        s.cookie(),
+        part_header("partial.bin"),
+    );
+    sock.write_all(head.as_bytes()).await.unwrap();
+    sock.write_all(&vec![7u8; 1024 * 1024]).await.unwrap();
+
+    let started = eventually(Duration::from_secs(5), || {
+        s.files().iter().any(|n| n.ends_with(".part"))
+    })
+    .await;
+    assert!(started, "upload never started: {:?}", s.files());
+
+    drop(sock);
+    let cleaned = eventually(Duration::from_secs(5), || s.files().is_empty()).await;
+    assert!(cleaned, "left behind: {:?}", s.files());
+}
+
+/// Streams a multi-GB body to check that large files work and memory stays
+/// flat (watch the test process in Task Manager while it runs).
+/// Run with: cargo test --release --test integration -- --ignored --nocapture huge
+#[tokio::test]
+#[ignore = "writes 3 GB to disk; run manually"]
+async fn huge_upload_streams_to_disk() {
+    use axum::body::Bytes;
+
+    const CHUNK: usize = 1024 * 1024;
+    const CHUNKS: usize = 3 * 1024;
+
+    let s = TestServer::start().await;
+    let chunk = Bytes::from(vec![0x5a_u8; CHUNK]);
+    let head = Bytes::from(part_header("huge.bin"));
+    let tail = Bytes::from(format!("\r\n--{BOUNDARY}--\r\n"));
+    let parts = std::iter::once(head)
+        .chain(std::iter::repeat_n(chunk, CHUNKS))
+        .chain(std::iter::once(tail))
+        .map(Ok::<_, std::io::Error>);
+    let body = reqwest::Body::wrap_stream(futures::stream::iter(parts));
+
+    let started = Instant::now();
+    let res = s.post_upload(body).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let elapsed = started.elapsed();
+
+    let size = std::fs::metadata(s.path().join("huge.bin")).unwrap().len();
+    assert_eq!(size, (CHUNK * CHUNKS) as u64);
+    assert_eq!(s.files(), ["huge.bin"]);
+    println!(
+        "3 GB in {:.1}s ({:.0} MB/s)",
+        elapsed.as_secs_f64(),
+        size as f64 / 1_048_576.0 / elapsed.as_secs_f64()
+    );
 }

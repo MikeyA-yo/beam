@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use beam::{config, net, server};
+use beam::{config, net, server, upload};
 
 /// Send files between this PC and your phone over the local network.
 #[derive(Parser)]
@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
         None => config::default_dir()?,
     };
     let shared = config::prepare_dir(&dir)?;
+    let removed = upload::remove_stale_parts(&shared.canonical);
+    if removed > 0 {
+        tracing::info!("Removed {removed} unfinished upload(s) left by an earlier run.");
+    }
     let token = config::generate_token();
 
     let listener = server::bind(cli.port).await?;

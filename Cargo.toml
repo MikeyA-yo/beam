@@ -20,7 +20,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13.5", default-features = false }
+futures = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 tempfile = "3.27.0"
 
 # Only for SO_EXCLUSIVEADDRUSE in src/socket.rs. Same version clap already pulls in.

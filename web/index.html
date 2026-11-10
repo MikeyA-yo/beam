@@ -13,6 +13,11 @@
     --accent: #2563eb;
     --accent-text: #ffffff;
     --border: #e2e4e8;
+    --track: #e7e9ee;
+    --ok: #15803d;
+    --bad: #c62828;
+    --warn-bg: #fff4e5;
+    --warn-text: #7a4100;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -23,6 +28,11 @@
       --accent: #4f8cff;
       --accent-text: #0b0d10;
       --border: #2c3038;
+      --track: #2c3038;
+      --ok: #4ade80;
+      --bad: #ff6b6b;
+      --warn-bg: #3a2a10;
+      --warn-text: #ffd59a;
     }
   }
   * { box-sizing: border-box; }
@@ -34,7 +44,7 @@
   }
   main { max-width: 640px; margin: 0 auto; padding: 16px; }
   h1 { font-size: 1.4rem; margin: 8px 0 16px; }
-  h2 { font-size: 1.1rem; margin: 0 0 12px; }
+  h2 { font-size: 1.1rem; margin: 0; }
   section {
     background: var(--card);
     border: 1px solid var(--border);
@@ -42,42 +52,342 @@
     padding: 16px;
     margin-bottom: 16px;
   }
+  .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .banner {
+    background: var(--warn-bg);
+    color: var(--warn-text);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-weight: 600;
+  }
   .pick {
     display: block;
     width: 100%;
     min-height: 56px;
-    padding: 14px;
-    border: 0;
+    padding: 15px;
     border-radius: 12px;
     background: var(--accent);
     color: var(--accent-text);
-    font: inherit;
     font-weight: 600;
     text-align: center;
     cursor: pointer;
+    user-select: none;
   }
+  .pick:active { opacity: 0.85; }
   .pick input { display: none; }
-  .empty { color: var(--muted); margin: 0; }
+  .hint, .empty { color: var(--muted); font-size: 0.9rem; margin: 8px 0 0; }
+  .summary { color: var(--muted); font-size: 0.9rem; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  #uploads:not(:empty) { margin-top: 12px; }
+  .item { padding: 10px 0; border-top: 1px solid var(--border); }
+  .item:first-child { border-top: 0; }
+  .line { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-weight: 500; }
+  .size { color: var(--muted); font-size: 0.85rem; white-space: nowrap; }
+  .status { color: var(--muted); font-size: 0.9rem; min-width: 0; overflow-wrap: anywhere; }
+  .item[data-state="done"] .status { color: var(--ok); }
+  .item[data-state="failed"] .status { color: var(--bad); }
+  progress {
+    display: block;
+    width: 100%;
+    height: 8px;
+    margin: 8px 0 6px;
+    border: 0;
+    border-radius: 4px;
+    background: var(--track);
+    overflow: hidden;
+    appearance: none;
+  }
+  progress::-webkit-progress-bar { background: var(--track); }
+  progress::-webkit-progress-value { background: var(--accent); transition: width 0.2s; }
+  progress::-moz-progress-bar { background: var(--accent); }
+  .item[data-state="done"] progress::-webkit-progress-value { background: var(--ok); }
+  .item[data-state="done"] progress::-moz-progress-bar { background: var(--ok); }
+  .item[data-state="failed"] progress::-webkit-progress-value { background: var(--bad); }
+  .item[data-state="failed"] progress::-moz-progress-bar { background: var(--bad); }
+  button.small {
+    min-height: 40px;
+    min-width: 72px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+    flex: none;
+  }
+  button.small:active { background: var(--track); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
   <h1>Beam</h1>
 
+  <div class="banner" id="banner" role="alert" hidden>
+    Not connected anymore. Scan the QR code on the PC again.
+  </div>
+
   <section id="send">
-    <h2>Send to PC</h2>
+    <div class="head">
+      <h2>Send to PC</h2>
+      <span class="summary" id="upload-summary" aria-live="polite"></span>
+    </div>
     <label class="pick">
       Choose files
       <input id="file-input" type="file" multiple>
     </label>
+    <p class="hint">Keep this page open until your files are sent.</p>
     <ul id="uploads"></ul>
+    <div class="line" id="upload-tools" hidden>
+      <span></span>
+      <button class="small" id="clear-done" type="button">Clear finished</button>
+    </div>
   </section>
 
   <section id="receive">
-    <h2>On PC</h2>
-    <p class="empty" id="files-empty">No files yet.</p>
+    <div class="head"><h2>On PC</h2></div>
+    <p class="empty" id="files-empty">Files on the PC will show up here.</p>
     <ul id="files"></ul>
   </section>
 </main>
+
+<script>
+(() => {
+  "use strict";
+
+  // Two at a time keeps the Wi-Fi busy while each file still gets its own
+  // progress bar. More rarely helps, because the link is the limit.
+  const MAX_PARALLEL = 2;
+  const SPEED_WINDOW_MS = 2000;
+
+  const input = document.getElementById("file-input");
+  const list = document.getElementById("uploads");
+  const summary = document.getElementById("upload-summary");
+  const tools = document.getElementById("upload-tools");
+  const clearDone = document.getElementById("clear-done");
+  const banner = document.getElementById("banner");
+
+  const items = [];
+  let active = 0;
+  let expired = false;
+
+  input.addEventListener("change", () => {
+    // The browser hands us File handles. Nothing is read into memory here:
+    // XMLHttpRequest streams each file from storage as it sends it.
+    for (const file of input.files) addItem(file);
+    input.value = ""; // so picking the same file again still fires "change"
+    pump();
+  });
+
+  clearDone.addEventListener("click", () => {
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].state === "done" || items[i].state === "cancelled") {
+        items[i].row.li.remove();
+        items.splice(i, 1);
+      }
+    }
+    updateSummary();
+  });
+
+  window.addEventListener("beforeunload", (e) => {
+    if (items.some((it) => it.state === "uploading" || it.state === "queued")) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
+
+  function addItem(file) {
+    const row = buildRow(file);
+    const item = { file, row, state: "queued", xhr: null };
+    row.cancel.addEventListener("click", () => cancel(item));
+    row.retry.addEventListener("click", () => retry(item));
+    items.push(item);
+    list.append(row.li);
+    setState(item, "queued", "Waiting…");
+  }
+
+  function buildRow(file) {
+    const li = el("li", "item");
+    const top = el("div", "line");
+    const name = el("span", "name", file.name);
+    name.title = file.name;
+    top.append(name, el("span", "size", formatBytes(file.size)));
+
+    const bar = document.createElement("progress");
+    bar.max = 1;
+    bar.value = 0;
+
+    const bottom = el("div", "line");
+    const status = el("span", "status");
+    const cancel = el("button", "small", "Cancel");
+    const retry = el("button", "small", "Retry");
+    cancel.type = retry.type = "button";
+    bottom.append(status, cancel, retry);
+
+    li.append(top, bar, bottom);
+    return { li, bar, status, cancel, retry };
+  }
+
+  function pump() {
+    if (expired) return;
+    for (const item of items) {
+      if (active >= MAX_PARALLEL) break;
+      if (item.state === "queued") start(item);
+    }
+    updateSummary();
+  }
+
+  function start(item) {
+    const xhr = new XMLHttpRequest();
+    const samples = [];
+    item.xhr = xhr;
+    active++;
+    setState(item, "uploading", "Starting…");
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (!e.lengthComputable || e.total === 0) return;
+      const frac = e.loaded / e.total;
+      item.row.bar.value = frac;
+      if (frac >= 1) {
+        // The bytes are sent; the PC is moving the file into place.
+        item.row.status.textContent = "Finishing…";
+        return;
+      }
+      const now = performance.now();
+      samples.push([now, e.loaded]);
+      while (samples.length > 2 && now - samples[0][0] > SPEED_WINDOW_MS) samples.shift();
+      const [t0, b0] = samples[0];
+      const pct = Math.floor(frac * 100) + "%";
+      item.row.status.textContent = now - t0 > 250
+        ? `${pct} · ${formatBytes(((e.loaded - b0) * 1000) / (now - t0))}/s`
+        : pct;
+    });
+
+    xhr.addEventListener("load", () => {
+      if (!settle(item, xhr)) return;
+      if (xhr.status === 200) {
+        succeed(item, parseJson(xhr.responseText));
+      } else if (xhr.status === 401) {
+        expire();
+        setState(item, "failed", "Not connected. Scan the QR code again.");
+      } else {
+        const msg = parseJson(xhr.responseText)?.error;
+        failed(item, msg ? capitalize(msg) + "." : `The PC refused the file (error ${xhr.status}).`);
+      }
+      pump();
+    });
+    xhr.addEventListener("error", () => {
+      if (!settle(item, xhr)) return;
+      failed(item, "Connection lost. Check the Wi-Fi, then tap Retry.");
+      pump();
+    });
+    xhr.addEventListener("abort", () => {
+      if (!settle(item, xhr)) return;
+      setState(item, "cancelled", "Cancelled");
+      pump();
+    });
+
+    const form = new FormData();
+    form.append("file", item.file, item.file.name);
+    xhr.open("POST", "/api/upload");
+    xhr.send(form);
+  }
+
+  // Marks the request as finished exactly once, whichever event fires.
+  function settle(item, xhr) {
+    if (item.xhr !== xhr) return false;
+    item.xhr = null;
+    active--;
+    return true;
+  }
+
+  function succeed(item, body) {
+    const saved = body?.files?.[0]?.name;
+    let text = "Sent";
+    if (saved && saved !== item.file.name) text += ` · saved as “${saved}”`;
+    item.row.bar.value = 1;
+    setState(item, "done", text);
+  }
+
+  function failed(item, message) {
+    setState(item, "failed", message);
+  }
+
+  function cancel(item) {
+    if (item.state === "uploading" && item.xhr) {
+      item.xhr.abort(); // the server deletes the partial file
+    } else if (item.state === "queued") {
+      setState(item, "cancelled", "Cancelled");
+      pump();
+    }
+  }
+
+  function retry(item) {
+    if (expired) return;
+    item.row.bar.value = 0;
+    setState(item, "queued", "Waiting…");
+    pump();
+  }
+
+  function expire() {
+    if (expired) return;
+    expired = true;
+    banner.hidden = false;
+    for (const item of items) {
+      if (item.state === "queued") setState(item, "failed", "Not sent. Scan the QR code again.");
+    }
+  }
+
+  function setState(item, state, text) {
+    item.state = state;
+    item.row.li.dataset.state = state;
+    item.row.status.textContent = text;
+    item.row.cancel.hidden = !(state === "queued" || state === "uploading");
+    item.row.retry.hidden = expired || !(state === "failed" || state === "cancelled");
+    updateSummary();
+  }
+
+  function updateSummary() {
+    const total = items.length;
+    const done = items.filter((it) => it.state === "done").length;
+    const bad = items.filter((it) => it.state === "failed").length;
+    const finished = items.some((it) => it.state === "done" || it.state === "cancelled");
+    if (total === 0) {
+      summary.textContent = "";
+    } else {
+      summary.textContent = `${done} of ${total} sent` + (bad ? ` · ${bad} failed` : "");
+    }
+    tools.hidden = !finished;
+  }
+
+  function parseJson(text) {
+    try { return JSON.parse(text); } catch { return null; }
+  }
+
+  function capitalize(s) {
+    return s.charAt(0).toUpperCase() + s.slice(1);
+  }
+
+  // Same 1024-based units as the PC's terminal and Windows Explorer.
+  function formatBytes(n) {
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    if (i === 0) return `${Math.round(n)} B`;
+    return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+})();
+</script>
 </body>
 </html>
