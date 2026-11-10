@@ -19,6 +19,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, BufWriter};
 
+use crate::events::Event;
 use crate::human;
 use crate::sanitize::sanitize_filename;
 use crate::server::AppState;
@@ -134,6 +135,11 @@ pub async fn handle(
         match save_field(field, &state.dir, &sent_name).await {
             Ok(saved) => {
                 log_received(&saved, &sent_name, peer, started.elapsed());
+                let _ = state.events.send(Event::UploadCompleted {
+                    name: saved.name.clone(),
+                    size: saved.size,
+                    modified: unix_now(),
+                });
                 files.push(saved);
             }
             Err(e) => {
@@ -152,6 +158,12 @@ pub async fn handle(
         return Err(UploadError::NoFiles);
     }
     Ok(Json(UploadResponse { files }))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn log_received(saved: &Saved, sent_name: &str, peer: SocketAddr, elapsed: Duration) {

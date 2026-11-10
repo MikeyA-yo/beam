@@ -15,8 +15,10 @@ use rust_embed::Embed;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::{broadcast, watch};
 
-use crate::{auth, files, socket, upload};
+use crate::events::{self, Event};
+use crate::{auth, files, socket, upload, watcher};
 
 /// How many ports to try, starting from the requested one.
 pub const PORT_ATTEMPTS: u16 = 10;
@@ -34,6 +36,11 @@ pub struct AppState {
     pub token: Arc<str>,
     /// Canonical shared folder.
     pub dir: Arc<PathBuf>,
+    /// Live updates for every connected page.
+    pub events: broadcast::Sender<Event>,
+    /// Flips to `true` on Ctrl+C so long-lived tasks (WebSockets, the
+    /// watcher) stop on their own instead of holding up the shutdown.
+    shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl AppState {
@@ -41,7 +48,17 @@ impl AppState {
         Self {
             token: token.into(),
             dir: Arc::new(dir),
+            events: events::channel(),
+            shutdown: Arc::new(watch::channel(false).0),
         }
+    }
+
+    pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutdown.send_replace(true);
     }
 }
 
@@ -94,6 +111,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/files", get(files::list_handler))
         .route("/api/files/{name}", get(files::download_handler))
+        .route("/ws", get(events::ws_handler))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -102,17 +120,18 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Serves until `shutdown` resolves, then gives transfers in progress
-/// [`SHUTDOWN_GRACE`] to finish.
+/// Watches the folder and serves until `shutdown` resolves, then gives
+/// transfers in progress [`SHUTDOWN_GRACE`] to finish.
 pub async fn serve(
     listener: TcpListener,
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
+    let _watcher = watcher::start(state.clone()).await;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
         listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
         let _ = stop_rx.await;
@@ -124,6 +143,7 @@ pub async fn serve(
         result = &mut server => return result,
         () = shutdown => {}
     }
+    state.begin_shutdown();
     let _ = stop_tx.send(());
     match tokio::time::timeout(SHUTDOWN_GRACE, server).await {
         Ok(result) => result,

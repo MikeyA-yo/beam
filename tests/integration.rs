@@ -22,6 +22,8 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let token = beam::config::generate_token();
         let state = AppState::new(token.clone(), dir.path().canonicalize().unwrap());
+        // Ends with the test's runtime.
+        beam::watcher::start(state.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -725,4 +727,265 @@ async fn hidden_files_are_not_listed_or_served() {
         s.get("/api/files/private.txt").await.status(),
         StatusCode::NOT_FOUND
     );
+}
+
+// ---- Live updates (M4) ----
+
+/// Just enough of a WebSocket client for these tests: handshake, then read
+/// the server's (unmasked) frames. Server pings come every 20 s, longer
+/// than any test runs, so control frames only need to be skipped.
+struct WsClient {
+    sock: tokio::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+impl WsClient {
+    /// Returns the response status line on failure.
+    async fn connect(s: &TestServer, cookie: Option<String>) -> Result<Self, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        let cookie = cookie
+            .map(|c| format!("Cookie: {c}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "GET /ws HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{cookie}\r\n",
+            s.addr
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let end = loop {
+            let n = sock.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                return Err(String::from_utf8_lossy(&buf).into_owned());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+        let status = head.lines().next().unwrap_or("").to_owned();
+        if !status.starts_with("HTTP/1.1 101") {
+            return Err(status);
+        }
+        Ok(Self {
+            sock,
+            buf: buf[end..].to_vec(),
+        })
+    }
+
+    async fn fill(&mut self, want: usize) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = [0u8; 4096];
+        while self.buf.len() < want {
+            match self.sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        true
+    }
+
+    /// Next text message as JSON, or `None` on close or timeout.
+    async fn next(&mut self, timeout: Duration) -> Option<serde_json::Value> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if !self.fill(2).await {
+                    return None;
+                }
+                let opcode = self.buf[0] & 0x0f;
+                let (len, header) = match self.buf[1] & 0x7f {
+                    126 => {
+                        self.fill(4).await;
+                        (u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize, 4)
+                    }
+                    127 => {
+                        self.fill(10).await;
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&self.buf[2..10]);
+                        (u64::from_be_bytes(b) as usize, 10)
+                    }
+                    n => (n as usize, 2),
+                };
+                if !self.fill(header + len).await {
+                    return None;
+                }
+                let payload: Vec<u8> = self.buf.drain(..header + len).skip(header).collect();
+                match opcode {
+                    0x1 => return Some(serde_json::from_slice(&payload).unwrap()),
+                    0x8 => return None,
+                    _ => {} // ping/pong
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Waits for an event matching `want`, skipping others.
+    async fn expect(
+        &mut self,
+        what: &str,
+        want: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            match self.next(deadline - Instant::now()).await {
+                Some(v) if want(&v) => return v,
+                Some(v) => seen.push(v),
+                None => break,
+            }
+        }
+        panic!("no {what} event within 5s; saw {seen:?}");
+    }
+
+    /// Collects everything that arrives in `window`.
+    async fn drain(&mut self, window: Duration) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + window;
+        let mut seen = Vec::new();
+        while let Some(v) = self
+            .next(deadline.saturating_duration_since(Instant::now()))
+            .await
+        {
+            seen.push(v);
+        }
+        seen
+    }
+}
+
+fn is_event(v: &serde_json::Value, kind: &str, name: &str) -> bool {
+    v["type"] == kind && v["name"] == name
+}
+
+#[tokio::test]
+async fn websocket_requires_cookie() {
+    let s = TestServer::start().await;
+    let err = WsClient::connect(&s, None)
+        .await
+        .err()
+        .expect("must be refused");
+    assert!(err.starts_with("HTTP/1.1 401"), "{err}");
+    let err = WsClient::connect(&s, Some("beam_session=wrong".into()))
+        .await
+        .err()
+        .expect("must be refused");
+    assert!(err.starts_with("HTTP/1.1 401"), "{err}");
+}
+
+#[tokio::test]
+async fn file_dropped_into_the_folder_is_announced() {
+    let s = TestServer::start().await;
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    let started = Instant::now();
+    std::fs::write(s.path().join("dropped.pdf"), b"from explorer").unwrap();
+    let v = ws
+        .expect("file_added", |v| is_event(v, "file_added", "dropped.pdf"))
+        .await;
+    assert_eq!(v["size"], 13);
+    assert!(v["modified"].as_u64().unwrap() > 0);
+    // PRD: "within about a second".
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn removed_and_renamed_files_are_announced() {
+    let s = TestServer::start().await;
+    s.put("a.txt", b"1", 60);
+    s.put("b.txt", b"2", 60);
+    // Wait for the watcher to settle on the files created above.
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    ws.drain(Duration::from_millis(1500)).await;
+
+    std::fs::remove_file(s.path().join("a.txt")).unwrap();
+    ws.expect("file_removed", |v| is_event(v, "file_removed", "a.txt"))
+        .await;
+
+    std::fs::rename(s.path().join("b.txt"), s.path().join("c.txt")).unwrap();
+    ws.expect("file_removed", |v| is_event(v, "file_removed", "b.txt"))
+        .await;
+    ws.expect("file_added", |v| is_event(v, "file_added", "c.txt"))
+        .await;
+}
+
+#[tokio::test]
+async fn uploads_announce_completion_and_never_their_part_file() {
+    let s = TestServer::start().await;
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    let data = sample(3 * 1024 * 1024);
+    s.upload_one("phone.mp4", &data).await;
+
+    let done = ws
+        .expect("upload_completed", |v| {
+            is_event(v, "upload_completed", "phone.mp4")
+        })
+        .await;
+    assert_eq!(done["size"], data.len());
+    let rest = ws.drain(Duration::from_millis(1500)).await;
+    assert!(
+        rest.iter().any(|v| is_event(v, "file_added", "phone.mp4")),
+        "{rest:?}"
+    );
+    assert!(
+        !rest
+            .iter()
+            .any(|v| v["name"].as_str().is_some_and(|n| n.ends_with(".part"))),
+        "{rest:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_connected_page_gets_the_events() {
+    let s = TestServer::start().await;
+    let mut a = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    let mut b = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    std::fs::write(s.path().join("both.txt"), b"x").unwrap();
+    a.expect("file_added", |v| is_event(v, "file_added", "both.txt"))
+        .await;
+    b.expect("file_added", |v| is_event(v, "file_added", "both.txt"))
+        .await;
+}
+
+/// An Explorer-style copy: the size is set up front and the writer keeps the
+/// file open. The phone must not see it until the copy finishes.
+#[cfg(windows)]
+#[tokio::test]
+async fn files_still_being_copied_are_announced_only_when_done() {
+    use std::io::Write;
+    let s = TestServer::start().await;
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+
+    let mut writer = std::fs::File::create(s.path().join("big.mkv")).unwrap();
+    writer.set_len(50 * 1024 * 1024).unwrap();
+    for _ in 0..10 {
+        writer.write_all(&[1u8; 64 * 1024]).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let during = ws.drain(Duration::from_millis(300)).await;
+    assert!(
+        !during.iter().any(|v| v["name"] == "big.mkv"),
+        "announced while copying: {during:?}"
+    );
+    let listing = s.get("/api/files").await.text().await.unwrap();
+    assert!(
+        !listing.contains("big.mkv"),
+        "listed while copying: {listing}"
+    );
+    assert_eq!(
+        s.get("/api/files/big.mkv").await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    drop(writer);
+    let done = ws
+        .expect("file_added", |v| is_event(v, "file_added", "big.mkv"))
+        .await;
+    assert_eq!(done["size"], 50 * 1024 * 1024);
 }

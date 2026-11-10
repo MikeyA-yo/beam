@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod events;
 pub mod files;
 mod human;
 pub mod net;
@@ -15,3 +16,4 @@ pub mod sanitize;
 pub mod server;
 mod socket;
 pub mod upload;
+pub mod watcher;

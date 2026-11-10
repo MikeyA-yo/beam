@@ -147,6 +147,24 @@
     text-decoration: none;
   }
   a.dl:active { opacity: 0.85; }
+  .tools { display: flex; align-items: center; gap: 10px; }
+  .live {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+  }
+  .live::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .live[data-state="live"]::before { background: var(--ok); }
+  .live[data-state="reconnecting"]::before { background: var(--bad); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -178,7 +196,10 @@
   <section id="receive">
     <div class="head">
       <h2>On PC</h2>
-      <button class="small" id="refresh" type="button">Refresh</button>
+      <div class="tools">
+        <span class="live" id="live" data-state="connecting" aria-live="polite">Connecting…</span>
+        <button class="small" id="refresh" type="button">Refresh</button>
+      </div>
     </div>
     <p class="empty" id="files-empty">Loading…</p>
     <ul id="files"></ul>
@@ -341,7 +362,8 @@
     if (saved && saved !== item.file.name) text += ` · saved as “${saved}”`;
     item.row.bar.value = 1;
     setState(item, "done", text);
-    refreshSoon();
+    // With live updates on, the server's upload_completed event updates the list.
+    if (!socket || socket.readyState !== WebSocket.OPEN) refreshSoon();
   }
 
   function failed(item, message) {
@@ -380,26 +402,49 @@
     refreshTimer = setTimeout(loadFiles, 400);
   }
 
+  const filesByName = new Map();
+  // Events that arrive while a list request is in flight. Replayed on top of
+  // the response, because the response may be older than the events.
+  let eventsDuringLoad = [];
+
   function loadFiles() {
     if (expired) return Promise.resolve();
     if (loading) return loading; // one request at a time
     refreshBtn.disabled = true;
+    eventsDuringLoad = [];
     loading = fetch("/api/files", { cache: "no-store" })
       .then((res) => {
         if (res.status === 401) { expire(); return null; }
         if (!res.ok) throw new Error(`error ${res.status}`);
         return res.json();
       })
-      .then((body) => { if (body) renderFiles(body.files || []); })
+      .then((body) => {
+        if (!body) return;
+        filesByName.clear();
+        for (const f of body.files || []) filesByName.set(f.name, f);
+        for (const ev of eventsDuringLoad) applyEvent(ev);
+        renderFiles();
+      })
       .catch(() => {
         filesEmpty.hidden = false;
         filesEmpty.textContent = "Couldn't load the list. Check the Wi-Fi, then tap Refresh.";
       })
-      .finally(() => { loading = null; refreshBtn.disabled = false; });
+      .finally(() => { loading = null; eventsDuringLoad = []; refreshBtn.disabled = expired; });
     return loading;
   }
 
-  function renderFiles(files) {
+  // Upserts and removals are idempotent, so replaying an event is harmless.
+  function applyEvent(ev) {
+    if (ev.type === "file_added" || ev.type === "upload_completed") {
+      filesByName.set(ev.name, { name: ev.name, size: ev.size, modified: ev.modified });
+    } else if (ev.type === "file_removed") {
+      filesByName.delete(ev.name);
+    }
+  }
+
+  function renderFiles() {
+    const files = [...filesByName.values()].sort((a, b) =>
+      b.modified - a.modified || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     const rows = files.map((f) => {
       const li = el("li", "file");
       const info = el("div", "info");
@@ -433,11 +478,75 @@
     return `${date}, ${time}`;
   }
 
+  // ---- Live updates over a WebSocket ----
+
+  const live = document.getElementById("live");
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 15000;
+  let socket = null;
+  let retryDelay = RETRY_MIN_MS;
+  let retryTimer = 0;
+
+  function connect() {
+    if (expired || socket) return;
+    clearTimeout(retryTimer);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    socket = ws;
+    ws.addEventListener("open", () => {
+      retryDelay = RETRY_MIN_MS;
+      setLive("live", "Live");
+      // Fetch after subscribing, so nothing that changes in between is missed.
+      loadFiles();
+    });
+    ws.addEventListener("message", (e) => {
+      const ev = parseJson(e.data);
+      if (!ev) return;
+      if (ev.type === "resync") { loadFiles(); return; }
+      applyEvent(ev);
+      if (loading) eventsDuringLoad.push(ev);
+      renderFiles();
+    });
+    ws.addEventListener("close", () => {
+      if (socket !== ws) return;
+      socket = null;
+      if (expired) return;
+      setLive("reconnecting", "Reconnecting…");
+      // A refused handshake looks like any other close. Asking the API tells
+      // us whether the session ended (401 shows the banner) or the PC is
+      // just unreachable.
+      loadFiles();
+      const jitter = 0.75 + Math.random() * 0.5;
+      retryTimer = setTimeout(connect, retryDelay * jitter);
+      retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+    });
+  }
+
+  // Phones pause background tabs; reconnect right away on return.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && !socket && !expired) {
+      retryDelay = RETRY_MIN_MS;
+      connect();
+    }
+  });
+
+  function setLive(state, text) {
+    live.dataset.state = state;
+    live.textContent = text;
+  }
+
   function expire() {
     if (expired) return;
     expired = true;
     banner.hidden = false;
     refreshBtn.disabled = true;
+    clearTimeout(retryTimer);
+    live.hidden = true;
+    if (socket) {
+      const ws = socket;
+      socket = null;
+      ws.close();
+    }
     for (const item of items) {
       if (item.state === "queued") setState(item, "failed", "Not sent. Scan the QR code again.");
     }
@@ -489,7 +598,7 @@
     return node;
   }
 
-  loadFiles();
+  connect();
 })();
 </script>
 </body>

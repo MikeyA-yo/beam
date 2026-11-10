@@ -12,7 +12,7 @@ use std::fs::{self, DirEntry, Metadata};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::Json;
 use axum::body::Body;
@@ -53,23 +53,98 @@ struct Visible {
     meta: Metadata,
 }
 
+/// Files modified or created more recently than these are checked for a
+/// writer still holding them open. Older files skip the check, so listing a
+/// folder of old files costs no extra I/O.
+const SETTLE_TIME: Duration = Duration::from_secs(3);
+/// A Windows copy gets a fresh creation time when it starts, and keeps it.
+/// This covers copies of up to ~100 GB at 30 MB/s.
+const COPY_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// One look at the shared folder.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// Ready files, newest first.
+    pub files: Vec<FileEntry>,
+    /// Files left out because another program is still writing them.
+    pub busy: usize,
+}
+
 /// Files in `dir` (top level only), newest first.
 pub fn list(dir: &Path) -> io::Result<Vec<FileEntry>> {
-    let mut files: Vec<FileEntry> = fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .filter_map(|entry| inspect(&entry, dir))
-        .map(|v| FileEntry {
+    scan(dir).map(|s| s.files)
+}
+
+pub fn scan(dir: &Path) -> io::Result<Scan> {
+    let mut scan = Scan::default();
+    for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
+        let Some(v) = inspect(&entry, dir) else {
+            continue;
+        };
+        if is_being_written(&v) {
+            scan.busy += 1;
+            continue;
+        }
+        scan.files.push(FileEntry {
             modified: modified_secs(&v.meta),
             size: v.meta.len(),
             name: v.name,
-        })
-        .collect();
-    files.sort_by(|a, b| {
+        });
+    }
+    scan.files.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
             .then_with(|| a.name.cmp(&b.name))
     });
-    Ok(files)
+    Ok(scan)
+}
+
+/// True while another program is still copying or saving the file.
+///
+/// Windows (Explorer, `CopyFileEx`) sets the full size before writing the
+/// data. Without this check the phone could download a 2 GB file that is
+/// mostly zeros. While copying, the copier holds the file open for writing.
+/// At the end, the lock goes away and the modified time is set to the
+/// source's. Measured on Windows 11.
+///
+/// The modified time alone can't tell when to check. On a busy disk it
+/// stalled for 15 s mid-copy. The creation time is set when the copy
+/// starts, so a young file of either kind gets the lock check.
+fn is_being_written(v: &Visible) -> bool {
+    let younger_than = |time: io::Result<std::time::SystemTime>, limit: Duration| {
+        time.ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < limit)
+    };
+    let young =
+        younger_than(v.meta.modified(), SETTLE_TIME) || younger_than(v.meta.created(), COPY_WINDOW);
+    young && locked_for_writing(&v.path)
+}
+
+/// Tries to open the file while refusing to share write access. Windows
+/// refuses that with a sharing violation if someone has it open for writing.
+/// The probe handle lives for microseconds and only runs on just-modified files.
+#[cfg(windows)]
+fn locked_for_writing(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+    {
+        Ok(_) => false,
+        Err(e) => e.raw_os_error() == Some(ERROR_SHARING_VIOLATION),
+    }
+}
+
+/// Linux and macOS have no mandatory locks to detect a writer with, so
+/// files show up as soon as they appear.
+#[cfg(not(windows))]
+fn locked_for_writing(_path: &Path) -> bool {
+    false
 }
 
 /// The canonical path of the listed file called exactly `name`, if any.
@@ -84,6 +159,7 @@ pub fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .find(|entry| entry.file_name() == name)
         .and_then(|entry| inspect(&entry, dir))
+        .filter(|v| !is_being_written(v))
         .map(|v| v.path)
 }
 
@@ -488,6 +564,74 @@ mod tests {
         fs::write(dir.join("keep.txt"), b"x").unwrap();
         fs::write(dir.join(".DS_Store"), b"x").unwrap();
         assert_eq!(names(&dir), ["keep.txt"]);
+    }
+
+    /// Mirrors an Explorer copy: full size already set, writer still open.
+    #[cfg(windows)]
+    #[test]
+    fn files_still_being_written_are_held_back() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = canon(&tmp);
+        write_aged(&dir, "done.txt", b"x", 600);
+        let mut writer = fs::File::create(dir.join("copying.mp4")).unwrap();
+        writer.set_len(10_000_000).unwrap();
+        writer.write_all(b"first bytes").unwrap();
+
+        let scan = scan(&dir).unwrap();
+        assert_eq!(scan.busy, 1);
+        assert_eq!(names(&dir), ["done.txt"]);
+        assert_eq!(resolve(&dir, "copying.mp4"), None);
+
+        drop(writer);
+        assert_eq!(names(&dir), ["copying.mp4", "done.txt"]);
+        assert!(resolve(&dir, "copying.mp4").is_some());
+    }
+
+    /// The case the end-to-end test caught: on a busy disk the modified time
+    /// stopped moving for 15 s mid-copy. The file was created moments ago and
+    /// is still held for writing, so it must stay hidden.
+    #[cfg(windows)]
+    #[test]
+    fn stalled_copies_are_still_held_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = canon(&tmp);
+        let writer = fs::File::create(dir.join("stalled.mkv")).unwrap();
+        writer.set_len(1_000_000).unwrap();
+        writer
+            .set_modified(SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(scan(&dir).unwrap().busy, 1);
+        assert!(names(&dir).is_empty());
+        drop(writer);
+        assert_eq!(names(&dir), ["stalled.mkv"]);
+    }
+
+    #[test]
+    fn old_files_open_for_writing_are_not_held_back() {
+        // Past the settle time the lock probe doesn't even run, so a log
+        // file some program keeps open stays visible.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = canon(&tmp);
+        write_aged(&dir, "app.log", b"x", 600);
+        let writer = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("app.log"))
+            .unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt;
+            let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+            writer
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_created(two_hours_ago)
+                        .set_modified(two_hours_ago),
+                )
+                .unwrap();
+        }
+        assert_eq!(names(&dir), ["app.log"]);
+        drop(writer);
     }
 
     #[test]
