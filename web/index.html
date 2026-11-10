@@ -120,6 +120,33 @@
     flex: none;
   }
   button.small:active { background: var(--track); }
+  button.small:disabled { opacity: 0.5; }
+  #files .file {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
+  }
+  #files .file:first-child { border-top: 0; }
+  .info { flex: 1; min-width: 0; }
+  .info .name { display: block; }
+  .meta { color: var(--muted); font-size: 0.85rem; }
+  a.dl {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    min-width: 96px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  a.dl:active { opacity: 0.85; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -149,8 +176,11 @@
   </section>
 
   <section id="receive">
-    <div class="head"><h2>On PC</h2></div>
-    <p class="empty" id="files-empty">Files on the PC will show up here.</p>
+    <div class="head">
+      <h2>On PC</h2>
+      <button class="small" id="refresh" type="button">Refresh</button>
+    </div>
+    <p class="empty" id="files-empty">Loading…</p>
     <ul id="files"></ul>
   </section>
 </main>
@@ -311,6 +341,7 @@
     if (saved && saved !== item.file.name) text += ` · saved as “${saved}”`;
     item.row.bar.value = 1;
     setState(item, "done", text);
+    refreshSoon();
   }
 
   function failed(item, message) {
@@ -333,10 +364,80 @@
     pump();
   }
 
+  // ---- On PC: listing and downloads ----
+
+  const fileList = document.getElementById("files");
+  const filesEmpty = document.getElementById("files-empty");
+  const refreshBtn = document.getElementById("refresh");
+  let loading = null;
+  let refreshTimer = 0;
+
+  refreshBtn.addEventListener("click", () => loadFiles());
+
+  // Many uploads can finish in a burst; refetch once after they settle.
+  function refreshSoon() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(loadFiles, 400);
+  }
+
+  function loadFiles() {
+    if (expired) return Promise.resolve();
+    if (loading) return loading; // one request at a time
+    refreshBtn.disabled = true;
+    loading = fetch("/api/files", { cache: "no-store" })
+      .then((res) => {
+        if (res.status === 401) { expire(); return null; }
+        if (!res.ok) throw new Error(`error ${res.status}`);
+        return res.json();
+      })
+      .then((body) => { if (body) renderFiles(body.files || []); })
+      .catch(() => {
+        filesEmpty.hidden = false;
+        filesEmpty.textContent = "Couldn't load the list. Check the Wi-Fi, then tap Refresh.";
+      })
+      .finally(() => { loading = null; refreshBtn.disabled = false; });
+    return loading;
+  }
+
+  function renderFiles(files) {
+    const rows = files.map((f) => {
+      const li = el("li", "file");
+      const info = el("div", "info");
+      const name = el("span", "name", f.name);
+      name.title = f.name;
+      info.append(name, el("span", "meta", `${formatBytes(f.size)} · ${formatWhen(f.modified)}`));
+      const link = el("a", "dl", "Download");
+      link.href = "/api/files/" + encodeURIComponent(f.name);
+      link.download = f.name;
+      link.setAttribute("aria-label", `Download ${f.name}`);
+      li.append(info, link);
+      return li;
+    });
+    fileList.replaceChildren(...rows);
+    filesEmpty.hidden = files.length > 0;
+    filesEmpty.textContent = "No files yet. Put files in the shared folder on the PC.";
+  }
+
+  function formatWhen(secs) {
+    if (!secs) return "";
+    const d = new Date(secs * 1000);
+    const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const startOfToday = new Date().setHours(0, 0, 0, 0);
+    const dayMs = 24 * 60 * 60 * 1000;
+    if (d >= startOfToday) return `Today ${time}`;
+    if (d >= startOfToday - dayMs) return `Yesterday ${time}`;
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    const date = d.toLocaleDateString([], sameYear
+      ? { day: "numeric", month: "short" }
+      : { day: "numeric", month: "short", year: "numeric" });
+    return `${date}, ${time}`;
+  }
+
   function expire() {
     if (expired) return;
     expired = true;
     banner.hidden = false;
+    refreshBtn.disabled = true;
     for (const item of items) {
       if (item.state === "queued") setState(item, "failed", "Not sent. Scan the QR code again.");
     }
@@ -387,6 +488,8 @@
     if (text !== undefined) node.textContent = text;
     return node;
   }
+
+  loadFiles();
 })();
 </script>
 </body>

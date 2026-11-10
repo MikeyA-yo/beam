@@ -16,7 +16,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::TcpListener;
 
-use crate::{auth, socket, upload};
+use crate::{auth, files, socket, upload};
 
 /// How many ports to try, starting from the requested one.
 pub const PORT_ATTEMPTS: u16 = 10;
@@ -92,6 +92,8 @@ pub fn router(state: AppState) -> Router {
             "/api/upload",
             post(upload::handle).layer(DefaultBodyLimit::disable()),
         )
+        .route("/api/files", get(files::list_handler))
+        .route("/api/files/{name}", get(files::download_handler))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

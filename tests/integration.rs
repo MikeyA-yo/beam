@@ -463,3 +463,266 @@ async fn huge_upload_streams_to_disk() {
         size as f64 / 1_048_576.0 / elapsed.as_secs_f64()
     );
 }
+
+// ---- Listing and downloads (M3) ----
+
+impl TestServer {
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .header(COOKIE, self.cookie())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn get_range(&self, path: &str, range: &str) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .header(COOKIE, self.cookie())
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn put(&self, name: &str, data: &[u8], age_secs: u64) {
+        let path = self.path().join(name);
+        std::fs::write(&path, data).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+}
+
+fn header<'a>(res: &'a reqwest::Response, name: &str) -> &'a str {
+    res.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("missing {name}"))
+        .to_str()
+        .unwrap()
+}
+
+fn sample(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+#[tokio::test]
+async fn listing_and_downloads_require_cookie() {
+    let s = TestServer::start().await;
+    s.put("a.txt", b"x", 0);
+    for path in ["/api/files", "/api/files/a.txt"] {
+        let res = s.client.get(s.url(path)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn listing_is_newest_first_and_hides_partials_and_folders() {
+    let s = TestServer::start().await;
+    s.put("old.txt", b"1", 3600);
+    s.put("new.mp4", b"22", 5);
+    s.put("mid.pdf", b"333", 600);
+    s.put("upload.mp4.beam-0badc0de.part", b"partial", 0);
+    std::fs::create_dir(s.path().join("folder")).unwrap();
+
+    let res = s.get("/api/files").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&res.text().await.unwrap()).unwrap();
+    let files = json["files"].as_array().unwrap();
+    let got: Vec<(&str, u64)> = files
+        .iter()
+        .map(|f| (f["name"].as_str().unwrap(), f["size"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(got, [("new.mp4", 2), ("mid.pdf", 3), ("old.txt", 1)]);
+    assert!(files[0]["modified"].as_u64().unwrap() > files[2]["modified"].as_u64().unwrap());
+}
+
+#[tokio::test]
+async fn uploaded_files_show_up_in_the_listing() {
+    let s = TestServer::start().await;
+    s.upload_one("from-phone.jpg", b"jpeg").await;
+    let body = s.get("/api/files").await.text().await.unwrap();
+    assert!(body.contains("\"from-phone.jpg\""), "{body}");
+}
+
+#[tokio::test]
+async fn full_download_is_an_attachment_with_the_right_bytes() {
+    let s = TestServer::start().await;
+    let data = sample(300_000);
+    s.put("clip.mp4", &data, 0);
+
+    let res = s.get("/api/files/clip.mp4").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        header(&res, "content-disposition"),
+        "attachment; filename=\"clip.mp4\"; filename*=UTF-8''clip.mp4"
+    );
+    assert_eq!(header(&res, "accept-ranges"), "bytes");
+    assert_eq!(header(&res, "content-length"), "300000");
+    assert_eq!(header(&res, "content-type"), "video/mp4");
+    assert_eq!(res.bytes().await.unwrap().as_ref(), data.as_slice());
+}
+
+#[tokio::test]
+async fn range_requests_return_206_with_the_right_bytes() {
+    let s = TestServer::start().await;
+    let data = sample(1000);
+    s.put("song.mp3", &data, 0);
+
+    let res = s.get_range("/api/files/song.mp3", "bytes=10-19").await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header(&res, "content-range"), "bytes 10-19/1000");
+    assert_eq!(header(&res, "content-length"), "10");
+    assert!(header(&res, "content-disposition").starts_with("attachment;"));
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &data[10..20]);
+
+    // Resuming from an offset, as a browser does after a dropped download.
+    let res = s.get_range("/api/files/song.mp3", "bytes=990-").await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &data[990..]);
+
+    // The last N bytes.
+    let res = s.get_range("/api/files/song.mp3", "bytes=-5").await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.bytes().await.unwrap().as_ref(), &data[995..]);
+}
+
+#[tokio::test]
+async fn bad_and_multi_ranges_are_handled() {
+    let s = TestServer::start().await;
+    s.put("a.bin", &sample(1000), 0);
+
+    let res = s.get_range("/api/files/a.bin", "bytes=5000-").await;
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(header(&res, "content-range"), "bytes */1000");
+
+    // Several ranges in one request get the whole file rather than an error.
+    let res = s.get_range("/api/files/a.bin", "bytes=0-1,5-6").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.bytes().await.unwrap().len(), 1000);
+}
+
+#[tokio::test]
+async fn head_reports_size_without_a_body() {
+    let s = TestServer::start().await;
+    s.put("a.bin", &sample(4321), 0);
+    let res = s
+        .client
+        .head(s.url("/api/files/a.bin"))
+        .header(COOKIE, s.cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header(&res, "content-length"), "4321");
+    assert!(res.bytes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unicode_names_download_with_an_encoded_filename() {
+    let s = TestServer::start().await;
+    s.put("фото 📷.jpg", b"img", 0);
+    let res = s
+        .get("/api/files/%D1%84%D0%BE%D1%82%D0%BE%20%F0%9F%93%B7.jpg")
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let disposition = header(&res, "content-disposition").to_owned();
+    assert!(
+        disposition.ends_with("filename*=UTF-8''%D1%84%D0%BE%D1%82%D0%BE%20%F0%9F%93%B7.jpg"),
+        "{disposition}"
+    );
+    assert_eq!(res.bytes().await.unwrap().as_ref(), b"img");
+}
+
+#[tokio::test]
+async fn names_outside_the_listing_are_404() {
+    let s = TestServer::start().await;
+    s.put("a.txt", b"inside", 0);
+    s.put("video.mp4.beam-0badc0de.part", b"partial", 0);
+    std::fs::create_dir(s.path().join("sub")).unwrap();
+    std::fs::write(s.path().join("sub").join("deep.txt"), b"deep").unwrap();
+    // A real file just outside the shared folder, so traversal has a target.
+    let secret_name = format!("beam-secret-{}.txt", &s.token[..8]);
+    let secret = s.path().parent().unwrap().join(&secret_name);
+    std::fs::write(&secret, b"secret").unwrap();
+
+    let attempts = [
+        format!("/api/files/..%2F{secret_name}"),
+        format!("/api/files/..%5C{secret_name}"),
+        format!("/api/files/%2E%2E%2F{secret_name}"),
+        "/api/files/%2E%2E".to_owned(),
+        "/api/files/sub%2Fdeep.txt".to_owned(),
+        "/api/files/sub".to_owned(),
+        format!(
+            "/api/files/{}",
+            secret
+                .to_string_lossy()
+                .replace('\\', "%5C")
+                .replace(':', "%3A")
+                .replace('/', "%2F")
+        ),
+        "/api/files/C%3A%5CWindows%5Cwin.ini".to_owned(),
+        "/api/files/%2Fetc%2Fpasswd".to_owned(),
+        "/api/files/a.txt%3Astream".to_owned(),
+        "/api/files/a.txt%3A%3A%24DATA".to_owned(),
+        "/api/files/CON".to_owned(),
+        "/api/files/video.mp4.beam-0badc0de.part".to_owned(),
+        "/api/files/missing.txt".to_owned(),
+    ];
+    for path in &attempts {
+        let res = s.get(path).await;
+        let status = res.status();
+        let body = res.bytes().await.unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path} gave {body:?}");
+        assert!(!body.starts_with(b"secret") && !body.starts_with(b"deep"));
+    }
+    let _ = std::fs::remove_file(&secret);
+}
+
+/// reqwest normalizes `..` out of URLs, so send a literal one by hand.
+#[tokio::test]
+async fn literal_dot_dot_in_the_path_is_404() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let s = TestServer::start().await;
+    s.put("a.txt", b"x", 0);
+    for target in [
+        "/api/files/../a.txt",
+        "/api/files/../../etc/passwd",
+        "/api/files/./a.txt/..",
+    ] {
+        let mut sock = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+        let req = format!(
+            "GET {target} HTTP/1.1\r\nHost: x\r\nCookie: {}\r\nConnection: close\r\n\r\n",
+            s.cookie()
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        sock.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 404"), "{target}: {reply}");
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn hidden_files_are_not_listed_or_served() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let s = TestServer::start().await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .attributes(0x2) // FILE_ATTRIBUTE_HIDDEN
+        .open(s.path().join("private.txt"))
+        .unwrap();
+    let listing = s.get("/api/files").await.text().await.unwrap();
+    assert!(!listing.contains("private.txt"));
+    assert_eq!(
+        s.get("/api/files/private.txt").await.status(),
+        StatusCode::NOT_FOUND
+    );
+}

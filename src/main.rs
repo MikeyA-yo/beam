@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use beam::{config, net, server, upload};
+use beam::{config, files, net, server, upload};
 
 /// Send files between this PC and your phone over the local network.
 #[derive(Parser)]
@@ -19,6 +19,10 @@ struct Cli {
     /// Port to listen on. If it is taken, the next few ports are tried.
     #[arg(long, default_value_t = 8080)]
     port: u16,
+
+    /// Files to offer to the phone. They are added to the shared folder:
+    /// hard-linked when possible (instant, no extra space), otherwise copied.
+    files: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -50,6 +54,12 @@ async fn main() -> anyhow::Result<()> {
         .port();
 
     print_banner(&shared.display, port, cli.port, &token);
+
+    if !cli.files.is_empty() {
+        let dir = shared.canonical.clone();
+        // Copies from another drive can take a while; don't hold up the server.
+        tokio::task::spawn_blocking(move || share_files(&cli.files, &dir));
+    }
 
     let state = server::AppState::new(token, shared.canonical);
     server::serve(listener, state, shutdown_signal())
@@ -102,6 +112,21 @@ fn print_banner(dir: &std::path::Path, port: u16, requested_port: u16, token: &s
     );
     println!("Press Ctrl+C to stop.");
     println!();
+}
+
+fn share_files(paths: &[PathBuf], dir: &std::path::Path) {
+    for path in paths {
+        match files::add_to_share(path, dir) {
+            Ok(files::Shared::Linked(name)) => tracing::info!("Sharing {name:?}"),
+            Ok(files::Shared::Copied(name)) => {
+                tracing::info!("Sharing {name:?} (copied, because it is on another drive)");
+            }
+            Ok(files::Shared::AlreadyThere(name)) => {
+                tracing::info!("Sharing {name:?} (already in the shared folder)");
+            }
+            Err(e) => tracing::warn!("Not shared: {e}"),
+        }
+    }
 }
 
 async fn shutdown_signal() {

@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod files;
 mod human;
 pub mod net;
 pub mod sanitize;
