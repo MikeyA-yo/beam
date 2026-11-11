@@ -28,7 +28,7 @@ Run one command on the PC, scan a QR code with the phone, and start sending file
 - Automatic device discovery (mDNS); the QR code is the discovery mechanism
 - Multiple PCs, multi-user accounts, or persistent pairing
 - Folder upload or zipped multi-file download
-- A GUI or tray app on the PC side (terminal output is enough)
+- A desktop GUI or tray app on the PC side (the terminal plus a local web page showing the QR code is enough; see FR-4a)
 
 ## 4. Users and scenarios
 
@@ -42,7 +42,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 ## 5. User flow
 
 1. User runs `beam` (optionally `beam --dir <path> --port <port>`).
-2. Terminal prints the URL and a QR code, for example `http://192.168.1.5:8080/?t=<token>`.
+2. Terminal prints the URL and a QR code, for example `http://192.168.1.5:8080/?t=<token>`, and the PC's browser opens a page showing the same QR code at a size that is easier to scan.
 3. User scans the QR with the phone camera. Chrome opens the page and the token is stored as a cookie.
 4. The page shows two sections: **Send to PC** (file picker plus upload progress) and **On PC** (list of files available to download).
 5. Uploads appear in the PC's shared folder. Files added to the shared folder on the PC appear on the phone's list without a manual refresh.
@@ -56,6 +56,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 - **FR-2:** Bind to `0.0.0.0` on a configurable port (default 8080). If the port is taken, try the next few and print the one used.
 - **FR-3:** Generate a random session token (at least 128 bits, URL-safe) on every start.
 - **FR-4:** Print the full URL and render it as a QR code in the terminal.
+- **FR-4a:** Also open the PC's default browser at a local page (`/qr`) that shows the QR code large, one per LAN address with a switcher. The page is a web UI served by Beam, not a desktop app, and sits behind the same cookie auth (the browser link exchanges the token first). The terminal output stays as in FR-4. `--no-open` disables opening the browser.
 - **FR-5:** Use a shared folder, by default `~/Downloads/Beam` (create it if missing), overridable with `--dir`.
 
 ### 6.2 Auth
@@ -108,6 +109,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 |---|---|---|
 | GET | `/?t=<token>` | Exchange token for cookie, redirect to `/` |
 | GET | `/` | Serve the embedded page |
+| GET | `/qr` | QR code page for the PC's browser (FR-4a) |
 | GET | `/api/files` | JSON list of shared files |
 | POST | `/api/upload` | Multipart upload, streamed to disk |
 | GET | `/api/files/{name}` | Download one file, with range support |
