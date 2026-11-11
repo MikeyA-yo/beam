@@ -181,6 +181,7 @@ async fn token_exchange_sets_strict_httponly_cookie_and_moves_to_root() {
     assert!(cookie.starts_with(&format!("beam_session={};", s.token)));
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Strict"));
+    assert!(cookie.contains("Max-Age=86400"));
     let body = res.text().await.unwrap();
     assert!(body.contains(r#"http-equiv="refresh" content="0;url=/""#));
 

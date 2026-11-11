@@ -26,11 +26,18 @@ pub fn has_valid_cookie(headers: &HeaderMap, token: &str) -> bool {
         .any(|(_, value)| tokens_match(token, value))
 }
 
-/// No `Max-Age`, so the cookie lasts for the browser session. It also stops
-/// working when the PC process exits, because the token changes on every run.
-/// No `Secure`, because v1 is plain HTTP.
+/// How long the phone stays logged in, at most. Without a `Max-Age` the
+/// cookie would only last for the browser session, and Android often closes
+/// Chrome in the background, so the phone was asked to scan again after
+/// just switching apps. The cookie still stops working the moment Beam
+/// exits, because the token changes on every run.
+pub const COOKIE_MAX_AGE_SECS: u32 = 24 * 60 * 60;
+
+/// No `Secure`, because Beam is plain HTTP.
 pub fn session_cookie(token: &str) -> String {
-    format!("{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict")
+    format!(
+        "{COOKIE_NAME}={token}; Path=/; Max-Age={COOKIE_MAX_AGE_SECS}; HttpOnly; SameSite=Strict"
+    )
 }
 
 pub const UNAUTHORIZED_TEXT: &str = "Not connected. Scan the QR code shown on the PC again.";
@@ -92,5 +99,7 @@ mod tests {
         assert!(c.contains("HttpOnly"));
         assert!(c.contains("SameSite=Strict"));
         assert!(c.contains("Path=/"));
+        // Survives the phone's browser restarting (but not Beam restarting).
+        assert!(c.contains("Max-Age=86400"));
     }
 }

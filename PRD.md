@@ -62,7 +62,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 
 ### 6.2 Auth
 
-- **FR-6:** A request to `/?t=<token>` with the correct token sets an `HttpOnly`, `SameSite=Strict` session cookie and redirects to `/` to strip the token from the URL.
+- **FR-6:** A request to `/?t=<token>` with the correct token sets an `HttpOnly`, `SameSite=Strict` session cookie and redirects to `/` to strip the token from the URL. The cookie has a 24-hour `Max-Age`, so the phone stays logged in when Android closes Chrome in the background. It still stops working when Beam exits, because the token changes on every run.
 - **FR-7:** Every other route rejects requests without a valid cookie with 401. The page shows a "scan the QR code again" message.
 - **FR-8:** Compare tokens in constant time.
 
@@ -183,4 +183,4 @@ v1 is done when all of these pass on the real setup (Windows laptop + Android ph
 
 - Final name for the project
 - Should the shared folder double as the upload destination, or should uploads and outgoing files live in separate folders?
-- Should a session expire after a period of inactivity, or only on process exit?
+- Should a session expire after a period of inactivity, or only on process exit? (Today: on process exit, or 24 hours after scanning, whichever comes first.)
