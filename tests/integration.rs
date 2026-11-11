@@ -15,6 +15,8 @@ struct TestServer {
     token: String,
     client: reqwest::Client,
     dir: TempDir,
+    /// Stands in for the PC's clipboard, which tests must never touch.
+    clipboard: beam::clipboard::Memory,
 }
 
 impl TestServer {
@@ -26,8 +28,10 @@ impl TestServer {
     async fn start_with_phone_urls(urls: impl FnOnce(&str) -> Vec<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token = beam::config::generate_token();
+        let clipboard = beam::clipboard::Memory::default();
         let state = AppState::new(token.clone(), dir.path().canonicalize().unwrap())
-            .with_phone_urls(urls(&token));
+            .with_phone_urls(urls(&token))
+            .with_clipboard(beam::clipboard::Clipboard::with_backend(clipboard.clone()));
         // Ends with the test's runtime.
         beam::watcher::start(state.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -50,6 +54,7 @@ impl TestServer {
             token,
             client,
             dir,
+            clipboard,
         }
     }
 
@@ -1049,4 +1054,175 @@ async fn exchange_with_next_qr_goes_to_the_qr_page_only() {
         assert!(page.contains(r#"content="0;url=/""#), "{other}: {page}");
         assert!(!page.contains("evil"), "{other}: {page}");
     }
+}
+
+// ---- Clipboard ----
+
+use beam::clipboard::{Clip, Format, Image};
+
+impl TestServer {
+    async fn put_clipboard(
+        &self,
+        content_type: &str,
+        body: impl Into<reqwest::Body>,
+    ) -> reqwest::Response {
+        self.client
+            .put(self.url("/api/clipboard"))
+            .header(COOKIE, self.cookie())
+            .header(CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+/// A 24-bit BMP laid out like the one the phone page builds.
+fn bmp(width: u32, height: u32) -> Vec<u8> {
+    let stride = (width as usize * 3).div_ceil(4) * 4;
+    let pixels = stride * height as usize;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
+    b.extend_from_slice(&[0; 4]);
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&width.to_le_bytes());
+    b.extend_from_slice(&height.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&[0; 24]);
+    b.extend((0..pixels).map(|i| (i % 253) as u8));
+    b
+}
+
+#[tokio::test]
+async fn clipboard_requires_cookie() {
+    let s = TestServer::start().await;
+    s.clipboard.set(Some(Clip::Text("secret".into())));
+    let res = s.client.get(s.url("/api/clipboard")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(!res.text().await.unwrap().contains("secret"));
+
+    let res = s
+        .client
+        .put(s.url("/api/clipboard"))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("intruder")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(s.clipboard.get(), Some(Clip::Text("secret".into())));
+}
+
+#[tokio::test]
+async fn empty_clipboard_is_204() {
+    let s = TestServer::start().await;
+    let res = s.get("/api/clipboard").await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn text_goes_to_the_pc_clipboard_and_back() {
+    let s = TestServer::start().await;
+    let text = "Wi-Fi password: áºžeam ðŸš€\nline two";
+    let res = s.put_clipboard("text/plain;charset=UTF-8", text).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(s.clipboard.get(), Some(Clip::Text(text.into())));
+
+    let res = s.get("/api/clipboard").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header(&res, "content-type"), "text/plain; charset=utf-8");
+    assert_eq!(header(&res, "cache-control"), "no-store");
+    assert_eq!(res.text().await.unwrap(), text);
+}
+
+#[tokio::test]
+async fn pc_clipboard_text_is_fetched() {
+    let s = TestServer::start().await;
+    s.clipboard.set(Some(Clip::Text("copied on the PC".into())));
+    let res = s.get("/api/clipboard").await;
+    assert_eq!(res.text().await.unwrap(), "copied on the PC");
+}
+
+#[tokio::test]
+async fn image_goes_to_the_pc_clipboard_and_back() {
+    let s = TestServer::start().await;
+    let image = bmp(5, 3);
+    let res = s.put_clipboard("image/bmp", image.clone()).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.clipboard.get(),
+        Some(Clip::Image(Image {
+            format: Format::Bmp,
+            bytes: image.clone()
+        }))
+    );
+
+    let res = s.get("/api/clipboard").await;
+    assert_eq!(header(&res, "content-type"), "image/bmp");
+    assert_eq!(res.bytes().await.unwrap().as_ref(), image.as_slice());
+}
+
+#[tokio::test]
+async fn pc_clipboard_png_is_fetched_as_png() {
+    let s = TestServer::start().await;
+    let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x02".to_vec();
+    s.clipboard.set(Some(Clip::Image(Image {
+        format: Format::Png,
+        bytes: png.clone(),
+    })));
+    let res = s.get("/api/clipboard").await;
+    assert_eq!(header(&res, "content-type"), "image/png");
+    assert_eq!(res.bytes().await.unwrap().as_ref(), png.as_slice());
+}
+
+#[tokio::test]
+async fn bad_clipboard_bodies_are_refused_and_change_nothing() {
+    let s = TestServer::start().await;
+    s.clipboard.set(Some(Clip::Text("keep me".into())));
+
+    let mut cut_short = bmp(10, 10);
+    cut_short.truncate(100);
+    let cases: [(&str, Vec<u8>, StatusCode); 5] = [
+        (
+            "image/bmp",
+            b"not an image".to_vec(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("image/bmp", cut_short, StatusCode::BAD_REQUEST),
+        (
+            "text/plain",
+            vec![0xff, 0xfe, 0x00],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "image/png",
+            b"\x89PNG".to_vec(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            "application/octet-stream",
+            b"x".to_vec(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ];
+    for (content_type, body, status) in cases {
+        let res = s.put_clipboard(content_type, body).await;
+        assert_eq!(res.status(), status, "{content_type}");
+        let json: serde_json::Value = serde_json::from_slice(&res.bytes().await.unwrap()).unwrap();
+        assert!(json["error"].as_str().is_some_and(|e| !e.is_empty()));
+    }
+    assert_eq!(s.clipboard.get(), Some(Clip::Text("keep me".into())));
+}
+
+/// The 2 MB default would refuse a phone screenshot.
+#[tokio::test]
+async fn clipboard_accepts_images_over_two_megabytes() {
+    let s = TestServer::start().await;
+    let image = bmp(1080, 2400); // about 7.4 MB, a typical phone screenshot
+    let res = s.put_clipboard("image/bmp", image.clone()).await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(matches!(s.clipboard.get(), Some(Clip::Image(img)) if img.bytes == image));
 }

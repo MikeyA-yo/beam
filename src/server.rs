@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
+use crate::clipboard::{self, Clipboard};
 use crate::events::{self, Event};
 use crate::{auth, files, human, qr, socket, upload, watcher};
 
@@ -41,24 +42,33 @@ pub struct AppState {
     /// The URLs a phone can open (with the token), best first. Shown as QR
     /// codes on `/qr`.
     pub phone_urls: Arc<Vec<String>>,
+    pub clipboard: Clipboard,
     /// Flips to `true` on Ctrl+C so long-lived tasks (WebSockets, the
     /// watcher) stop on their own instead of holding up the shutdown.
     shutdown: Arc<watch::Sender<bool>>,
 }
 
 impl AppState {
+    /// Uses the PC's real clipboard, which is only touched when the phone
+    /// asks. Tests swap in [`clipboard::Memory`] with [`Self::with_clipboard`].
     pub fn new(token: String, dir: PathBuf) -> Self {
         Self {
             token: token.into(),
             dir: Arc::new(dir),
             events: events::channel(),
             phone_urls: Arc::new(Vec::new()),
+            clipboard: Clipboard::system(),
             shutdown: Arc::new(watch::channel(false).0),
         }
     }
 
     pub fn with_phone_urls(mut self, urls: Vec<String>) -> Self {
         self.phone_urls = Arc::new(urls);
+        self
+    }
+
+    pub fn with_clipboard(mut self, clipboard: Clipboard) -> Self {
+        self.clipboard = clipboard;
         self
     }
 
@@ -121,6 +131,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/files", get(files::list_handler))
         .route("/api/files/{name}", get(files::download_handler))
+        .route(
+            "/api/clipboard",
+            get(clipboard::get_handler)
+                .put(clipboard::put_handler)
+                .layer(DefaultBodyLimit::max(clipboard::MAX_BODY_BYTES)),
+        )
         .route("/ws", get(events::ws_handler))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(

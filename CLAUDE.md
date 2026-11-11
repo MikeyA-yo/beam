@@ -6,11 +6,11 @@ Instructions for any AI coding agent working in this repo. Read `PRD.md` first; 
 
 ## Project in one paragraph
 
-Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files only. No clipboard, no HTTPS, no mobile app.
+Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files; v1.1 adds clipboard sharing on request (text on every platform, images on Windows). No HTTPS, no mobile app.
 
 ## Working style
 
-- Work milestone by milestone (M1 to M5 in the PRD). Finish and verify one before starting the next.
+- Work milestone by milestone (M1 to M6 in the PRD). Finish and verify one before starting the next.
 - Before writing code for a milestone, state briefly what you plan to change and which files you will touch.
 - Keep changes small and reviewable. Do not refactor unrelated code.
 - Do not add features outside v1 scope, even if they seem easy. If something seems missing from the PRD, ask instead of inventing it.
@@ -34,6 +34,8 @@ Rust stable, 2021 edition or newer. Expected crates (check crates.io for current
 - `rand` or `getrandom` for the token, `subtle` for constant-time comparison
 - `tracing` and `tracing-subscriber` for logs
 - `anyhow` in `main`, `thiserror` for typed errors in modules
+- `arboard` (default features off, so text only) for clipboard text
+- `windows-sys`, Windows only, for `SO_EXCLUSIVEADDRUSE` and clipboard images. Its `unsafe` stays in `socket.rs` and `clipboard/win.rs`, with a `SAFETY` comment on every block.
 - Dev only: `reqwest` and `tempfile` for integration tests
 
 ## Suggested layout
@@ -49,6 +51,8 @@ src/
   events.rs      WebSocket handler and broadcast channel
   watcher.rs     folder watching, emits events
   sanitize.rs    filename sanitization and path containment
+  clipboard.rs   clipboard thread, backends, /api/clipboard handlers
+  clipboard/     image.rs (BMP/PNG helpers), win.rs (Windows clipboard images)
 web/
   index.html     single page, inline or local CSS and JS only
 tests/
@@ -76,6 +80,7 @@ These come from the PRD and are not optional.
 - Upload progress is shown client-side with `XMLHttpRequest` upload progress events (`fetch` does not expose upload progress). Upload files one request at a time or with small concurrency so each has its own progress bar.
 - The WebSocket uses a `tokio::sync::broadcast` channel. Lagging receivers should resync by refetching `/api/files` rather than crashing.
 - `notify` can emit several events for one file write. Debounce, and ignore `.part` files so in-progress uploads never show as available downloads.
+- Clipboard: send the PC's clipboard only when the phone asks, and never log its contents (type and size only). It is held in memory by nature, so rule 1 doesn't apply, but the route has its own size cap. Tests must use `clipboard::Memory`; anything that touches the real clipboard is `#[ignore]`.
 - LAN IP detection: prefer private IPv4 ranges, skip loopback and link-local (169.254.x.x), and print every candidate if there are several.
 - On startup, print a one-line hint: if the phone cannot connect, allow the app through Windows Firewall on private networks, set the Wi-Fi profile to Private, or connect the PC to the phone's hotspot.
 - Use `PathBuf` and `std::path` everywhere. Do not build paths with string concatenation, because Windows uses backslashes.
@@ -107,4 +112,4 @@ All three of `fmt`, `clippy`, and `test` must pass before you call a milestone d
 
 ## Out of scope for v1 (do not build)
 
-Clipboard sync, HTTPS, PWA or service workers, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.
+Automatic clipboard sync, files on the clipboard, HTTPS, PWA or service workers, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.

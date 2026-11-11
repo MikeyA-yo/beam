@@ -6,7 +6,7 @@ Browser-based local file sharing between a PC and a phone. The PC runs a single 
 |---|---|
 | Owner | Ay |
 | Status | Draft |
-| Version | v1 (files only, no clipboard) |
+| Version | v1 (files), v1.1 (clipboard on request) |
 | Primary setup | HP laptop on Windows + Android phone (Chrome) |
 
 ## 1. Problem
@@ -21,7 +21,8 @@ Run one command on the PC, scan a QR code with the phone, and start sending file
 
 ## 3. Non-goals for v1
 
-- Clipboard sync (moved to v2)
+- Automatic clipboard sync. The PC's clipboard goes to the phone only when the user taps for it (see 6.7)
+- Files on the clipboard (copied in Explorer); use the shared folder for files
 - A native Android app, Tauri mobile build, or Termux component
 - HTTPS, PWA install, or Android share-sheet integration
 - Internet relay or transfers across different networks
@@ -94,6 +95,15 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 
 - **FR-25:** Log each connected device (IP and user agent), each completed transfer (direction, name, size, duration, average speed), and errors. Keep it readable, not noisy.
 
+### 6.7 Clipboard (v1.1)
+
+- **FR-26:** The page has a Clipboard section with a text box. **Send to PC** puts its text on the PC's clipboard.
+- **FR-27:** **Get from PC** reads the PC's clipboard once, when tapped. Beam never sends the clipboard on its own, so something copied on the PC (a password, say) doesn't reach the phone unless the user asks. Text fills the box and is copied to the phone's clipboard in the same tap. A **Copy** button copies the box again. Over plain HTTP the browser's modern clipboard API is unavailable, so the page uses the older copy command, which works on a tap.
+- **FR-28:** Images go both ways. From the phone, the user picks an image (or pastes one into the box where the keyboard allows). The phone's browser decodes it and sends a 24-bit BMP, scaled down to at most 32 megapixels, and the PC puts it on the clipboard as a bitmap that any Windows app can paste. From the PC, the phone gets the clipboard's PNG if there is one, otherwise the bitmap, and shows it with a **Save** button. Long-pressing the image copies it. Images on the clipboard work on Windows only for now; elsewhere the page shows a clear message. Text works on Windows, macOS and Linux.
+- **FR-29:** When there is both, text wins (copying Excel cells puts both on the clipboard). If there's neither, for example copied files, the page says there's nothing to get.
+- **FR-30:** Same cookie auth as everything else. The server checks images strictly before they reach the clipboard, and caps a clipboard request at 128 MB. Clipboard data is held in memory (it lives in memory on both ends anyway), unlike file uploads.
+- **FR-31:** The terminal logs each clipboard transfer with direction, IP, and type and size ("text, 42 characters" or "image, 1080×2400"), never the contents.
+
 ## 7. Non-functional requirements
 
 - **Single binary:** HTML, CSS, and JS are embedded in the binary. The page loads no external CDN, font, or script, because the phone may have no internet.
@@ -114,6 +124,8 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 | POST | `/api/upload` | Multipart upload, streamed to disk |
 | GET | `/api/files/{name}` | Download one file, with range support |
 | GET | `/ws` | WebSocket for live events |
+| GET | `/api/clipboard` | The PC's clipboard: text, PNG or BMP by `Content-Type`; 204 if empty (FR-27) |
+| PUT | `/api/clipboard` | Set the PC's clipboard from `text/plain` or `image/bmp` (FR-26, FR-28) |
 
 Example event over the WebSocket:
 
@@ -133,7 +145,7 @@ Example event over the WebSocket:
 
 ## 10. Security
 
-The threat model is other people on the same Wi-Fi. The token in the QR code is the only thing that grants access, it rotates on every run, and it never appears in server logs. Transport is plain HTTP in v1, so traffic on the local network is not encrypted; this is an accepted v1 tradeoff and HTTPS is planned for v2. Filename sanitization and path containment are mandatory because the server writes attacker-influenced names to disk.
+The threat model is other people on the same Wi-Fi. The token in the QR code is the only thing that grants access, it rotates on every run, and it never appears in server logs. Transport is plain HTTP in v1, so traffic on the local network is not encrypted; this is an accepted v1 tradeoff and HTTPS is planned for v2. Filename sanitization and path containment are mandatory because the server writes attacker-influenced names to disk. The clipboard can hold secrets, so it is only read when the phone asks and its contents are never logged.
 
 ## 11. Acceptance criteria
 
@@ -155,11 +167,12 @@ v1 is done when all of these pass on the real setup (Windows laptop + Android ph
 3. **M3:** file listing and range-capable downloads.
 4. **M4:** WebSocket events and folder watching.
 5. **M5:** UI polish (progress, speed, errors), logging, and the acceptance pass above.
+6. **M6 (v1.1):** clipboard text both ways, and images both ways on Windows (section 6.7).
 
 ## 13. Future (v2 and beyond)
 
-- Clipboard: PC clipboard pushed to the phone page with a copy button, and text sent from the phone set on the PC clipboard
-- HTTPS (local cert or the DNS-to-LAN-IP trick), which unlocks the real clipboard API, PWA install, and an Android share target
+- Clipboard extras: optional live sync, clipboard images on macOS and Linux
+- HTTPS (local cert or the DNS-to-LAN-IP trick), which unlocks the real clipboard API (reading the phone's clipboard with one tap, copying images directly), PWA install, and an Android share target
 - mDNS discovery and persistent pairing so the QR is only needed once
 - A PC-side web page with drag and drop
 - Folder uploads and zipped multi-file downloads

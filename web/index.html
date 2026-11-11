@@ -165,6 +165,52 @@
   }
   .live[data-state="live"]::before { background: var(--ok); }
   .live[data-state="reconnecting"]::before { background: var(--bad); }
+  textarea {
+    display: block;
+    width: 100%;
+    min-height: 96px;
+    resize: vertical;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+  }
+  .buttons { display: flex; gap: 10px; margin-top: 10px; }
+  .buttons > * { flex: 1; min-width: 0; }
+  .act {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 48px;
+    padding: 10px 12px;
+    border: 1px solid var(--accent);
+    border-radius: 12px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font: inherit;
+    font-weight: 600;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+  }
+  .act.alt { background: transparent; color: var(--text); border-color: var(--border); }
+  .act:active { opacity: 0.85; }
+  button.act:disabled, label.act[aria-disabled="true"] { opacity: 0.5; pointer-events: none; }
+  .act input { display: none; }
+  #clip-status { min-height: 1.45em; margin: 10px 0 0; font-size: 0.9rem; color: var(--muted); }
+  #clip-status[data-tone="ok"] { color: var(--ok); }
+  #clip-status[data-tone="bad"] { color: var(--bad); }
+  #clip-preview { margin-top: 12px; }
+  #clip-preview img {
+    display: block;
+    max-width: 100%;
+    max-height: 60vh;
+    margin: 0 auto 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -190,6 +236,32 @@
     <div class="line" id="upload-tools" hidden>
       <span></span>
       <button class="small" id="clear-done" type="button">Clear finished</button>
+    </div>
+  </section>
+
+  <section id="clip">
+    <div class="head">
+      <h2>Clipboard</h2>
+    </div>
+    <textarea id="clip-text" placeholder="Type here, or long-press and tap Paste" aria-label="Clipboard text"></textarea>
+    <div class="buttons">
+      <button class="act" id="clip-send" type="button">Send to PC</button>
+      <button class="act" id="clip-get" type="button">Get from PC</button>
+    </div>
+    <div class="buttons">
+      <button class="act alt" id="clip-copy" type="button">Copy</button>
+      <label class="act alt" id="clip-image-pick">
+        Send an image
+        <input id="clip-image" type="file" accept="image/*">
+      </label>
+    </div>
+    <p id="clip-status" aria-live="polite"></p>
+    <div id="clip-preview" hidden>
+      <img id="clip-img" alt="Image from the PC's clipboard">
+      <div class="line">
+        <span class="hint">Long-press the image to copy it.</span>
+        <a class="dl" id="clip-save" href="#">Save</a>
+      </div>
     </div>
   </section>
 
@@ -484,6 +556,232 @@
     return `${date}, ${time}`;
   }
 
+  // ---- Clipboard ----
+
+  // As a 24-bit bitmap this is about 96 MB, under the PC's 128 MB limit.
+  // Bigger photos are scaled down to it.
+  const MAX_CLIP_PIXELS = 32000000;
+
+  const clipText = document.getElementById("clip-text");
+  const clipSend = document.getElementById("clip-send");
+  const clipGet = document.getElementById("clip-get");
+  const clipCopy = document.getElementById("clip-copy");
+  const clipPick = document.getElementById("clip-image-pick");
+  const clipImageInput = document.getElementById("clip-image");
+  const clipStatus = document.getElementById("clip-status");
+  const clipPreview = document.getElementById("clip-preview");
+  const clipImg = document.getElementById("clip-img");
+  const clipSave = document.getElementById("clip-save");
+  let clipBusy = false;
+  let clipUrl = "";
+
+  clipSend.addEventListener("click", () => clipAction(async () => {
+    const text = clipText.value;
+    if (!text) {
+      clipSay("Type or paste something first.", "bad");
+      return;
+    }
+    const xhr = await clipRequest("PUT", text, "text/plain;charset=utf-8", "Sending…");
+    if (xhr) clipSay("Sent. Paste it on the PC.", "ok");
+  }));
+
+  clipGet.addEventListener("click", () => clipAction(async () => {
+    const xhr = await clipRequest("GET", null, null, "Getting…");
+    if (!xhr) return;
+    const type = xhr.getResponseHeader("Content-Type") || "";
+    if (xhr.status === 204 || !xhr.response) {
+      clipSay("Nothing to get. Copy some text or an image on the PC first.", "");
+    } else if (type.startsWith("text/")) {
+      const text = await xhr.response.text();
+      clipText.value = text;
+      hidePreview();
+      clipSay(copyText(text) ? "Copied from the PC." : "Got it from the PC. Tap Copy to copy it.", "ok");
+    } else if (type.startsWith("image/")) {
+      showImage(xhr.response, type);
+      clipSay("Got an image from the PC.", "ok");
+    }
+  }));
+
+  clipCopy.addEventListener("click", () => {
+    if (!clipText.value) {
+      clipSay("Nothing to copy yet.", "bad");
+    } else if (copyText(clipText.value)) {
+      clipSay("Copied.", "ok");
+    } else {
+      clipSay("Couldn't copy. Long-press the text and tap Copy.", "bad");
+    }
+  });
+
+  clipImageInput.addEventListener("change", () => {
+    const file = clipImageInput.files[0];
+    clipImageInput.value = "";
+    if (file) sendImage(file);
+  });
+
+  // Pasting an image into the box sends it, where the phone's keyboard
+  // or browser supports pasting images.
+  clipText.addEventListener("paste", (e) => {
+    const file = [...(e.clipboardData?.files || [])].find((f) => f.type.startsWith("image/"));
+    if (!file) return;
+    e.preventDefault();
+    sendImage(file);
+  });
+
+  function sendImage(file) {
+    clipAction(async () => {
+      clipSay("Preparing the image…", "");
+      let bmp;
+      try {
+        bmp = await toBmp(file);
+      } catch {
+        clipSay("Couldn't read that image.", "bad");
+        return;
+      }
+      const xhr = await clipRequest("PUT", bmp, "image/bmp", "Sending…");
+      if (xhr) clipSay("Image sent. Paste it on the PC.", "ok");
+    });
+  }
+
+  // One clipboard request at a time; the buttons are disabled meanwhile.
+  async function clipAction(run) {
+    if (clipBusy || expired) return;
+    clipBusy = true;
+    setClipButtons();
+    try {
+      await run();
+    } finally {
+      clipBusy = false;
+      setClipButtons();
+    }
+  }
+
+  // Resolves to the finished request, or null after showing what went wrong.
+  function clipRequest(method, body, type, busyText) {
+    clipSay(busyText, "");
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, "/api/clipboard");
+      xhr.responseType = "blob";
+      if (type) xhr.setRequestHeader("Content-Type", type);
+      if (body instanceof Blob && body.size > 1000000) {
+        xhr.upload.addEventListener("progress", (e) => {
+          if (e.lengthComputable) clipSay(`Sending… ${Math.floor((e.loaded / e.total) * 100)}%`, "");
+        });
+      }
+      xhr.addEventListener("load", async () => {
+        if (xhr.status < 400) { resolve(xhr); return; }
+        if (xhr.status === 401) {
+          expire();
+          clipSay("Not connected. Scan the QR code again.", "bad");
+        } else if (xhr.status === 413) {
+          clipSay("That's too large for the clipboard.", "bad");
+        } else {
+          const msg = parseJson(await xhr.response.text())?.error;
+          clipSay(msg ? capitalize(msg) + "." : `The PC couldn't do that (error ${xhr.status}).`, "bad");
+        }
+        resolve(null);
+      });
+      xhr.addEventListener("error", () => {
+        clipSay("Connection lost. Check the Wi-Fi and try again.", "bad");
+        resolve(null);
+      });
+      xhr.send(body);
+    });
+  }
+
+  // The modern clipboard API needs HTTPS, which Beam doesn't have yet, so
+  // this uses the older copy command on a hidden, read-only text box
+  // (read-only so the phone's keyboard doesn't pop up). It has to run
+  // soon after a tap, which it does.
+  function copyText(text) {
+    const box = document.createElement("textarea");
+    box.value = text;
+    box.readOnly = true;
+    box.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
+    document.body.append(box);
+    box.select();
+    box.setSelectionRange(0, text.length);
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    box.remove();
+    return ok;
+  }
+
+  function showImage(blob, type) {
+    if (clipUrl) URL.revokeObjectURL(clipUrl);
+    clipUrl = URL.createObjectURL(blob);
+    clipImg.src = clipUrl;
+    clipSave.href = clipUrl;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
+    clipSave.download = `clipboard-${stamp}.${type.includes("png") ? "png" : "bmp"}`;
+    clipPreview.hidden = false;
+  }
+
+  function hidePreview() {
+    clipPreview.hidden = true;
+    if (clipUrl) URL.revokeObjectURL(clipUrl);
+    clipUrl = "";
+    clipImg.removeAttribute("src");
+  }
+
+  // The PC can't decode JPEG or HEIC without an image library, but the
+  // phone's browser can. So the phone draws the image and sends plain
+  // pixels: a 24-bit bitmap, bottom-up, the layout every Windows app reads.
+  async function toBmp(file) {
+    const bitmap = await createImageBitmap(file);
+    const scale = Math.min(1, Math.sqrt(MAX_CLIP_PIXELS / (bitmap.width * bitmap.height)));
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    // 24-bit has no transparency; see-through parts become white.
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    bitmap.close();
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    canvas.width = canvas.height = 0; // let the phone free the canvas now
+
+    const stride = Math.ceil((width * 3) / 4) * 4;
+    const size = 54 + stride * height;
+    const buf = new ArrayBuffer(size);
+    const view = new DataView(buf);
+    const out = new Uint8Array(buf);
+    view.setUint8(0, 0x42); // "BM"
+    view.setUint8(1, 0x4d);
+    view.setUint32(2, size, true);
+    view.setUint32(10, 54, true); // pixels start right after the headers
+    view.setUint32(14, 40, true); // BITMAPINFOHEADER
+    view.setInt32(18, width, true);
+    view.setInt32(22, height, true); // positive: bottom row first
+    view.setUint16(26, 1, true); // planes
+    view.setUint16(28, 24, true); // bits per pixel
+    view.setUint32(34, stride * height, true);
+    for (let y = 0; y < height; y++) {
+      let src = (height - 1 - y) * width * 4;
+      let dst = 54 + y * stride;
+      for (let x = 0; x < width; x++, src += 4, dst += 3) {
+        out[dst] = rgba[src + 2]; // blue
+        out[dst + 1] = rgba[src + 1]; // green
+        out[dst + 2] = rgba[src]; // red
+      }
+    }
+    return new Blob([buf], { type: "image/bmp" });
+  }
+
+  function setClipButtons() {
+    const off = clipBusy || expired;
+    clipSend.disabled = clipGet.disabled = off;
+    clipPick.setAttribute("aria-disabled", String(off));
+  }
+
+  function clipSay(text, tone) {
+    clipStatus.textContent = text;
+    clipStatus.dataset.tone = tone;
+  }
+
   // ---- Live updates over a WebSocket ----
 
   const live = document.getElementById("live");
@@ -546,6 +844,7 @@
     expired = true;
     banner.hidden = false;
     refreshBtn.disabled = true;
+    setClipButtons();
     clearTimeout(retryTimer);
     live.hidden = true;
     if (socket) {
