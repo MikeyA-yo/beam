@@ -7,11 +7,13 @@
 #![deny(unsafe_code)]
 
 pub mod auth;
+pub mod browser;
 pub mod config;
 pub mod events;
 pub mod files;
 mod human;
 pub mod net;
+mod qr;
 pub mod sanitize;
 pub mod server;
 mod socket;

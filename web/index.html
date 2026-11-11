@@ -313,9 +313,15 @@
       while (samples.length > 2 && now - samples[0][0] > SPEED_WINDOW_MS) samples.shift();
       const [t0, b0] = samples[0];
       const pct = Math.floor(frac * 100) + "%";
-      item.row.status.textContent = now - t0 > 250
-        ? `${pct} · ${formatBytes(((e.loaded - b0) * 1000) / (now - t0))}/s`
-        : pct;
+      if (now - t0 < 250) {
+        item.row.status.textContent = pct;
+        return;
+      }
+      const speed = ((e.loaded - b0) * 1000) / (now - t0); // bytes per second
+      let text = `${pct} · ${formatBytes(speed)}/s`;
+      // A time estimate needs a second of data to be worth showing.
+      if (speed > 0 && now - t0 >= 1000) text += ` · ${formatEta((e.total - e.loaded) / speed)}`;
+      item.row.status.textContent = text;
     });
 
     xhr.addEventListener("load", () => {
@@ -572,10 +578,21 @@
       summary.textContent = `${done} of ${total} sent` + (bad ? ` · ${bad} failed` : "");
     }
     tools.hidden = !finished;
+    // Progress stays visible from the tab strip while browsing elsewhere.
+    const busy = items.some((it) => it.state === "uploading" || it.state === "queued");
+    document.title = busy ? `(${done}/${total}) Beam` : "Beam";
   }
 
   function parseJson(text) {
     try { return JSON.parse(text); } catch { return null; }
+  }
+
+  function formatEta(secs) {
+    if (!isFinite(secs)) return "";
+    if (secs < 60) return `${Math.max(1, Math.round(secs))} s left`;
+    if (secs < 3600) return `${Math.round(secs / 60)} min left`;
+    const h = Math.floor(secs / 3600);
+    return `${h} h ${Math.round((secs - h * 3600) / 60)} min left`;
   }
 
   function capitalize(s) {

@@ -46,9 +46,101 @@ pub fn duration(d: Duration) -> String {
     }
 }
 
+/// "Chrome 157 on Android 14" from a User-Agent header. Only for the
+/// terminal log, so it covers the common cases and falls back gracefully.
+pub fn agent(ua: &str) -> String {
+    // Order matters: Edge, Samsung, and Opera all also claim to be Chrome,
+    // and Chrome also claims to be Safari.
+    const BROWSERS: &[(&str, &str)] = &[
+        ("EdgA/", "Edge"),
+        ("EdgiOS/", "Edge"),
+        ("Edg/", "Edge"),
+        ("SamsungBrowser/", "Samsung Internet"),
+        ("OPR/", "Opera"),
+        ("FxiOS/", "Firefox"),
+        ("Firefox/", "Firefox"),
+        ("CriOS/", "Chrome"),
+        ("Chrome/", "Chrome"),
+        ("Version/", "Safari"),
+        ("curl/", "curl"),
+    ];
+    let browser = BROWSERS.iter().find_map(|(marker, name)| {
+        let rest = &ua[ua.find(marker)? + marker.len()..];
+        let major: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        Some(if major.is_empty() {
+            (*name).to_owned()
+        } else {
+            format!("{name} {major}")
+        })
+    });
+
+    let os = if let Some(i) = ua.find("Android") {
+        let version: String = ua[i + "Android".len()..]
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        Some(if version.is_empty() {
+            "Android".to_owned()
+        } else {
+            format!("Android {version}")
+        })
+    } else {
+        [
+            ("iPhone", "iPhone"),
+            ("iPad", "iPad"),
+            ("Windows", "Windows"),
+            ("CrOS", "ChromeOS"),
+            ("Mac OS X", "Mac"),
+            ("Linux", "Linux"),
+        ]
+        .iter()
+        .find(|(marker, _)| ua.contains(marker))
+        .map(|(_, name)| (*name).to_owned())
+    };
+
+    match (browser, os) {
+        (Some(b), Some(o)) => format!("{b} on {o}"),
+        (Some(b), None) => b,
+        (None, Some(o)) => format!("a browser on {o}"),
+        (None, None) => "an unknown browser".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents() {
+        let cases = [
+            (
+                "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
+                "Chrome 131 on Android 14",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0.0.0 Mobile Safari/537.36",
+                "Samsung Internet 23 on Android 13",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+                "Safari 17 on iPhone",
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0",
+                "Edge 157 on Windows",
+            ),
+            (
+                "Mozilla/5.0 (Android 14; Mobile; rv:132.0) Gecko/132.0 Firefox/132.0",
+                "Firefox 132 on Android 14",
+            ),
+            ("curl/8.14.1", "curl 8"),
+            ("", "an unknown browser"),
+        ];
+        for (ua, want) in cases {
+            assert_eq!(agent(ua), want, "{ua}");
+        }
+    }
 
     #[test]
     fn sizes() {

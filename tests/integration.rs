@@ -19,9 +19,15 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_phone_urls(|_| Vec::new()).await
+    }
+
+    /// `urls` gets the token and returns the phone URLs to advertise.
+    async fn start_with_phone_urls(urls: impl FnOnce(&str) -> Vec<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let token = beam::config::generate_token();
-        let state = AppState::new(token.clone(), dir.path().canonicalize().unwrap());
+        let state = AppState::new(token.clone(), dir.path().canonicalize().unwrap())
+            .with_phone_urls(urls(&token));
         // Ends with the test's runtime.
         beam::watcher::start(state.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -988,4 +994,59 @@ async fn files_still_being_copied_are_announced_only_when_done() {
         .expect("file_added", |v| is_event(v, "file_added", "big.mkv"))
         .await;
     assert_eq!(done["size"], 50 * 1024 * 1024);
+}
+
+// ---- QR page for the PC's browser (M5) ----
+
+#[tokio::test]
+async fn qr_page_requires_cookie() {
+    let s = TestServer::start().await;
+    let res = s.client.get(s.url("/qr")).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn qr_page_shows_a_code_for_every_address() {
+    let s = TestServer::start_with_phone_urls(|t| {
+        vec![
+            format!("http://192.168.1.5:8080/?t={t}"),
+            format!("http://10.0.0.7:8080/?t={t}"),
+        ]
+    })
+    .await;
+    let res = s.get("/qr").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(header(&res, "cache-control"), "no-store");
+    let body = res.text().await.unwrap();
+    assert_eq!(body.matches("<svg").count(), 2, "{body}");
+    assert!(body.contains(&format!("http://192.168.1.5:8080/?t={}", s.token)));
+    assert!(body.contains("data-pick=\"1\""), "address picker missing");
+    // The first code is visible, the second starts hidden.
+    assert!(body.contains("data-i=\"0\"><svg"));
+    assert!(body.contains("data-i=\"1\" hidden><svg"));
+}
+
+#[tokio::test]
+async fn qr_page_without_addresses_says_so() {
+    let s = TestServer::start().await;
+    let body = s.get("/qr").await.text().await.unwrap();
+    assert!(body.contains("No local network address found"));
+    assert!(!body.contains("<svg"));
+}
+
+#[tokio::test]
+async fn exchange_with_next_qr_goes_to_the_qr_page_only() {
+    let s = TestServer::start().await;
+    let body = |next: &'static str| {
+        let url = s.url(&format!("/?t={}&next={next}", s.token));
+        let client = s.client.clone();
+        async move { client.get(url).send().await.unwrap().text().await.unwrap() }
+    };
+    assert!(body("qr").await.contains(r#"content="0;url=/qr""#));
+    // Anything else falls back to the app, so `next` can't redirect elsewhere.
+    for other in ["https://evil.example", "//evil.example", "/api/files", "QR"] {
+        let page = body(other).await;
+        assert!(page.contains(r#"content="0;url=/""#), "{other}: {page}");
+        assert!(!page.contains("evil"), "{other}: {page}");
+    }
 }

@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::events::{self, Event};
-use crate::{auth, files, socket, upload, watcher};
+use crate::{auth, files, human, qr, socket, upload, watcher};
 
 /// How many ports to try, starting from the requested one.
 pub const PORT_ATTEMPTS: u16 = 10;
@@ -38,6 +38,9 @@ pub struct AppState {
     pub dir: Arc<PathBuf>,
     /// Live updates for every connected page.
     pub events: broadcast::Sender<Event>,
+    /// The URLs a phone can open (with the token), best first. Shown as QR
+    /// codes on `/qr`.
+    pub phone_urls: Arc<Vec<String>>,
     /// Flips to `true` on Ctrl+C so long-lived tasks (WebSockets, the
     /// watcher) stop on their own instead of holding up the shutdown.
     shutdown: Arc<watch::Sender<bool>>,
@@ -49,8 +52,14 @@ impl AppState {
             token: token.into(),
             dir: Arc::new(dir),
             events: events::channel(),
+            phone_urls: Arc::new(Vec::new()),
             shutdown: Arc::new(watch::channel(false).0),
         }
+    }
+
+    pub fn with_phone_urls(mut self, urls: Vec<String>) -> Self {
+        self.phone_urls = Arc::new(urls);
+        self
     }
 
     pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
@@ -103,6 +112,7 @@ pub async fn bind_on(ip: Ipv4Addr, port: u16) -> Result<TcpListener, BindError> 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/qr", get(qr_page))
         // axum's default 2 MB body limit would cut off any real upload.
         // The upload handler streams to disk, so lifting it costs no memory.
         .route(
@@ -157,6 +167,9 @@ pub async fn serve(
 #[derive(Deserialize)]
 struct IndexQuery {
     t: Option<String>,
+    /// `qr` sends the browser to `/qr` after the exchange. Only that value
+    /// is honored, so this can't be used as an open redirect.
+    next: Option<String>,
 }
 
 /// `/?t=<token>` exchanges the token for a cookie; plain `/` serves the app.
@@ -168,12 +181,22 @@ async fn index(
 ) -> Response {
     match query.t {
         Some(t) if auth::tokens_match(&state.token, &t) => {
-            let agent = headers
+            let ua = headers
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown browser");
-            tracing::info!("Device connected: {} ({agent})", peer.ip());
-            connected_response(&state.token)
+                .unwrap_or("");
+            if peer.ip().is_loopback() {
+                tracing::info!("Opened on this PC ({})", human::agent(ua));
+            } else {
+                tracing::info!("Connected: {} ({})", peer.ip(), human::agent(ua));
+            }
+            tracing::debug!("user agent: {ua}");
+            let target = if query.next.as_deref() == Some("qr") {
+                "/qr"
+            } else {
+                "/"
+            };
+            connected_response(&state.token, target)
         }
         Some(_) => {
             tracing::warn!(
@@ -189,15 +212,15 @@ async fn index(
     }
 }
 
-/// Sets the cookie and sends the browser on to `/`.
+/// Sets the cookie and sends the browser on to `target`.
 ///
 /// This is a 200 page with a meta refresh instead of a 30x redirect. The
 /// cookie is `SameSite=Strict` and the QR scan arrives as a cross-site
 /// navigation. A server redirect keeps that cross-site context, so the
 /// browser could drop the new cookie on the follow-up request. A refresh
 /// started by our own page counts as same-site.
-fn connected_response(token: &str) -> Response {
-    let mut res = html_page(StatusCode::OK, "connected.html");
+fn connected_response(token: &str, target: &str) -> Response {
+    let mut res = html_template(StatusCode::OK, "connected.html", &[("{{TARGET}}", target)]);
     match HeaderValue::from_str(&auth::session_cookie(token)) {
         Ok(cookie) => {
             res.headers_mut().insert(header::SET_COOKIE, cookie);
@@ -216,10 +239,26 @@ fn unauthorized_page() -> Response {
 }
 
 fn html_page(status: StatusCode, name: &str) -> Response {
+    match Assets::get(name) {
+        Some(file) => html_response(status, file.data),
+        None => missing_page(name),
+    }
+}
+
+/// An embedded page with `{{PLACEHOLDER}}`s filled in. Values must already
+/// be safe HTML.
+fn html_template(status: StatusCode, name: &str, values: &[(&str, &str)]) -> Response {
     let Some(file) = Assets::get(name) else {
-        tracing::error!("embedded page {name} is missing from the build");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
+        return missing_page(name);
     };
+    let mut page = String::from_utf8_lossy(&file.data).into_owned();
+    for (key, value) in values {
+        page = page.replace(key, value);
+    }
+    html_response(status, page)
+}
+
+fn html_response(status: StatusCode, body: impl Into<axum::body::Body>) -> Response {
     (
         status,
         [
@@ -229,9 +268,69 @@ fn html_page(status: StatusCode, name: &str) -> Response {
             // Keep the token URL out of any Referer header.
             (header::REFERRER_POLICY, "no-referrer"),
         ],
-        file.data,
+        body.into(),
     )
         .into_response()
+}
+
+fn missing_page(name: &str) -> Response {
+    tracing::error!("embedded page {name} is missing from the build");
+    (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
+}
+
+/// `GET /qr`: big QR codes for the PC's screen, easier to scan than the
+/// terminal. Behind the normal cookie check, because the codes contain
+/// the token.
+async fn qr_page(State(state): State<AppState>) -> Response {
+    html_template(
+        StatusCode::OK,
+        "qr.html",
+        &[("{{CODES}}", &qr_codes_html(&state.phone_urls))],
+    )
+}
+
+fn qr_codes_html(urls: &[String]) -> String {
+    use std::fmt::Write as _;
+    if urls.is_empty() {
+        return "<p class=\"none\">No local network address found. Is this PC connected \
+                to Wi-Fi?</p>"
+            .to_owned();
+    }
+    let mut codes = String::new();
+    let mut picker = String::new();
+    for (i, url) in urls.iter().enumerate() {
+        let Some(svg) = qr::svg(url) else { continue };
+        let hidden = if i == 0 { "" } else { " hidden" };
+        let url = escape_html(url);
+        let _ = write!(
+            codes,
+            "<figure class=\"qr\" data-i=\"{i}\"{hidden}>{svg}<figcaption>{url}</figcaption></figure>"
+        );
+        let host = url
+            .trim_start_matches("http://")
+            .split(':')
+            .next()
+            .unwrap_or_default();
+        let _ = write!(
+            picker,
+            "<button type=\"button\" data-pick=\"{i}\" aria-pressed=\"{}\">{host}</button>",
+            i == 0
+        );
+    }
+    if urls.len() > 1 {
+        let _ = write!(
+            codes,
+            "<div class=\"alts\"><p>Not connecting? Try another address of this PC:</p>{picker}</div>"
+        );
+    }
+    codes
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn not_found() -> impl IntoResponse {
