@@ -1,11 +1,12 @@
-//! Just enough of the BMP and PNG formats to move images between the
-//! phone's browser and the Windows clipboard, without an image library.
+//! Just enough of the image formats to move images between the phone's
+//! browser and the Windows clipboard, without an image library.
 //!
 //! The clipboard's `CF_DIB` format is a BMP file minus its 14-byte file
 //! header. Phone to PC: the page draws the image on a canvas and sends a
 //! plain 24-bit BMP, which we check strictly and strip to a DIB. PC to
 //! phone: we send the clipboard's PNG if it has one, otherwise we put the
-//! file header back on its DIB, and the browser shows either.
+//! file header back on its DIB. An image file copied in Explorer is sent
+//! as it is, in any format the phone's browser can show.
 
 use thiserror::Error;
 
@@ -24,9 +25,15 @@ const BI_BITFIELDS: u32 = 3;
 const BI_ALPHABITFIELDS: u32 = 6;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
+/// Bytes [`Format::sniff`] needs to recognise every format.
+pub const SNIFF_LEN: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Png,
+    Jpeg,
+    Gif,
+    Webp,
     Bmp,
 }
 
@@ -34,7 +41,29 @@ impl Format {
     pub fn mime(self) -> &'static str {
         match self {
             Format::Png => "image/png",
+            Format::Jpeg => "image/jpeg",
+            Format::Gif => "image/gif",
+            Format::Webp => "image/webp",
             Format::Bmp => "image/bmp",
+        }
+    }
+
+    /// The format of an image file, from its first bytes rather than its
+    /// name, so a misnamed file still works and a non-image doesn't get
+    /// through. Only formats every phone browser can show are recognised.
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if is_png(bytes) {
+            Some(Format::Png)
+        } else if bytes.starts_with(b"\xff\xd8\xff") {
+            Some(Format::Jpeg)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(Format::Gif)
+        } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            Some(Format::Webp)
+        } else if bmp_dimensions(bytes).is_some() {
+            Some(Format::Bmp)
+        } else {
+            None
         }
     }
 }
@@ -46,11 +75,14 @@ pub struct Image {
 }
 
 impl Image {
-    /// Width and height, read from the header.
+    /// Width and height, read from the header. Only for the log, so JPEG
+    /// and WebP, whose size is buried deeper, go without.
     pub fn dimensions(&self) -> Option<(u32, u32)> {
         match self.format {
             Format::Png => png_dimensions(&self.bytes),
+            Format::Gif => gif_dimensions(&self.bytes),
             Format::Bmp => bmp_dimensions(&self.bytes),
+            Format::Jpeg | Format::Webp => None,
         }
     }
 }
@@ -168,6 +200,13 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     }
     let be = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
     Some((be(16), be(20)))
+}
+
+fn gif_dimensions(gif: &[u8]) -> Option<(u32, u32)> {
+    let size = gif.get(6..10)?;
+    let w = u16::from_le_bytes([size[0], size[1]]);
+    let h = u16::from_le_bytes([size[2], size[3]]);
+    Some((w.into(), h.into()))
 }
 
 fn bmp_dimensions(bmp: &[u8]) -> Option<(u32, u32)> {
@@ -383,10 +422,48 @@ mod tests {
         };
         assert_eq!(bmp.dimensions(), Some((640, 480)));
 
+        let gif = Image {
+            format: Format::Gif,
+            bytes: b"GIF89a\x40\x01\xf0\x00rest".to_vec(),
+        };
+        assert_eq!(gif.dimensions(), Some((320, 240)));
+
         let junk = Image {
             format: Format::Png,
             bytes: b"not a png".to_vec(),
         };
         assert_eq!(junk.dimensions(), None);
+    }
+
+    #[test]
+    fn sniffs_formats_from_content() {
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 8]);
+        assert_eq!(Format::sniff(&png), Some(Format::Png));
+        assert_eq!(
+            Format::sniff(b"\xff\xd8\xff\xe0\x00\x10JFIF"),
+            Some(Format::Jpeg)
+        );
+        assert_eq!(Format::sniff(b"GIF87a\x01\x00"), Some(Format::Gif));
+        assert_eq!(
+            Format::sniff(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some(Format::Webp)
+        );
+        assert_eq!(Format::sniff(&bmp(2, 2, 24)), Some(Format::Bmp));
+    }
+
+    #[test]
+    fn sniff_refuses_everything_else() {
+        assert_eq!(Format::sniff(b""), None);
+        assert_eq!(Format::sniff(b"hello, world"), None);
+        assert_eq!(Format::sniff(b"%PDF-1.7"), None);
+        // A WAV file is RIFF too.
+        assert_eq!(Format::sniff(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
+        // "BM" alone, as a text file might start, isn't a bitmap.
+        assert_eq!(Format::sniff(b"BMW owners club"), None);
+        // A PNG signature with no header after it.
+        assert_eq!(Format::sniff(PNG_SIGNATURE), None);
     }
 }

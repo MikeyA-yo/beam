@@ -22,7 +22,7 @@ Run one command on the PC, scan a QR code with the phone, and start sending file
 ## 3. Non-goals for v1
 
 - Automatic clipboard sync. The PC's clipboard goes to the phone only when the user taps for it (see 6.7)
-- Files on the clipboard (copied in Explorer); use the shared folder for files
+- Files on the clipboard (copied in Explorer), except a single image file (FR-29); use the shared folder for files
 - A native Android app, Tauri mobile build, or Termux component
 - HTTPS, PWA install, or Android share-sheet integration
 - Internet relay or transfers across different networks
@@ -100,7 +100,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 - **FR-26:** The page has a Clipboard section with a text box. **Send to PC** puts its text on the PC's clipboard.
 - **FR-27:** **Get from PC** reads the PC's clipboard once, when tapped. Beam never sends the clipboard on its own, so something copied on the PC (a password, say) doesn't reach the phone unless the user asks. Text fills the box and is copied to the phone's clipboard in the same tap. A **Copy** button copies the box again. Over plain HTTP the browser's modern clipboard API is unavailable, so the page uses the older copy command, which works on a tap.
 - **FR-28:** Images go both ways. From the phone, the user picks an image (or pastes one into the box where the keyboard allows). The phone's browser decodes it and sends a 24-bit BMP, scaled down to at most 32 megapixels, and the PC puts it on the clipboard as a bitmap that any Windows app can paste. From the PC, the phone gets the clipboard's PNG if there is one, otherwise the bitmap, and shows it with a **Save** button. Long-pressing the image copies it. Images on the clipboard work on Windows only for now; elsewhere the page shows a clear message. Text works on Windows, macOS and Linux.
-- **FR-29:** When there is both, text wins (copying Excel cells puts both on the clipboard). If there's neither, for example copied files, the page says there's nothing to get.
+- **FR-29:** When there is both, text wins (copying Excel cells puts both on the clipboard). An image file copied in Explorer (Ctrl+C or right-click, Copy) puts only its path on the clipboard, not the picture, so on Windows Beam reads that file and sends it as it is, if it's a single PNG, JPEG, GIF, WebP or BMP of at most 128 MB, recognised by its content rather than its name. Several copied files, or a file that isn't such an image, get a clear message instead; those belong in the shared folder. If there's nothing usable at all, the page says there's nothing to get.
 - **FR-30:** Same cookie auth as everything else. The server checks images strictly before they reach the clipboard, and caps a clipboard request at 128 MB. Clipboard data is held in memory (it lives in memory on both ends anyway), unlike file uploads.
 - **FR-31:** The terminal logs each clipboard transfer with direction, IP, and type and size ("text, 42 characters" or "image, 1080×2400"), never the contents.
 
@@ -124,7 +124,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 | POST | `/api/upload` | Multipart upload, streamed to disk |
 | GET | `/api/files/{name}` | Download one file, with range support |
 | GET | `/ws` | WebSocket for live events |
-| GET | `/api/clipboard` | The PC's clipboard: text, PNG or BMP by `Content-Type`; 204 if empty (FR-27) |
+| GET | `/api/clipboard` | The PC's clipboard: text or an image (PNG, JPEG, GIF, WebP or BMP) by `Content-Type`; 204 if empty, 409 with a message if a copied file can't be sent (FR-27, FR-29) |
 | PUT | `/api/clipboard` | Set the PC's clipboard from `text/plain` or `image/bmp` (FR-26, FR-28) |
 
 Example event over the WebSocket:

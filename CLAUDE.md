@@ -52,7 +52,8 @@ src/
   watcher.rs     folder watching, emits events
   sanitize.rs    filename sanitization and path containment
   clipboard.rs   clipboard thread, backends, /api/clipboard handlers
-  clipboard/     image.rs (BMP/PNG helpers), win.rs (Windows clipboard images)
+  clipboard/     image.rs (image format helpers), dropfiles.rs (files copied in Explorer),
+                 win.rs (Windows clipboard images)
 web/
   index.html     single page, inline or local CSS and JS only
 tests/
@@ -112,4 +113,4 @@ All three of `fmt`, `clippy`, and `test` must pass before you call a milestone d
 
 ## Out of scope for v1 (do not build)
 
-Automatic clipboard sync, files on the clipboard, HTTPS, PWA or service workers, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.
+Automatic clipboard sync, files on the clipboard (other than a single copied image file), HTTPS, PWA or service workers, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.

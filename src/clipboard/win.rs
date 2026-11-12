@@ -6,11 +6,17 @@
 //! bitmap on the clipboard. Writing sets `CF_DIB` only. Windows makes the
 //! other bitmap formats from it when an app asks, so every app that
 //! pastes images can take it.
+//!
+//! A file copied in Explorer isn't an image on the clipboard, only its
+//! path. [`copied_files`] reads those paths, and the caller reads the file.
 
 #![allow(unsafe_code)]
 
+use std::ffi::OsString;
 use std::io;
 use std::marker::PhantomData;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
@@ -25,11 +31,14 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use super::ClipboardError;
+use super::dropfiles;
 use super::image::{self, Format, Image, ImageError, MAX_IMAGE_BYTES};
 
-/// Standard format number, from `winuser.h`. Defined here rather than
-/// pulling in all of windows-sys's OLE bindings for one constant.
+/// Standard format numbers, from `winuser.h`. Defined here rather than
+/// pulling in all of windows-sys's OLE bindings for two constants.
 const CF_DIB: u32 = 8;
+/// Files copied in Explorer.
+const CF_HDROP: u32 = 15;
 
 /// Another app (a clipboard manager, Office) can hold the clipboard for a
 /// moment. Waiting this long in total covers those without stalling.
@@ -61,6 +70,18 @@ pub fn read_image() -> Result<Option<Image>, ClipboardError> {
             Ok(None)
         }
     }
+}
+
+/// The files copied in Explorer, if that's what's on the clipboard.
+/// Empty if it holds anything else.
+pub fn copied_files() -> Result<Vec<PathBuf>, ClipboardError> {
+    let block = Open::new()?.read(CF_HDROP)?;
+    let paths = block.as_deref().and_then(dropfiles::parse);
+    Ok(paths
+        .unwrap_or_default()
+        .iter()
+        .map(|wide| PathBuf::from(OsString::from_wide(wide)))
+        .collect())
 }
 
 /// Replaces the clipboard with a BMP from the phone.
@@ -120,8 +141,8 @@ impl Open {
         if handle.is_null() {
             return Ok(None);
         }
-        // The formats we read (CF_DIB and registered ones) are global
-        // memory handles, which is what GlobalSize and GlobalLock take.
+        // The formats we read (CF_DIB, CF_HDROP and registered ones) are
+        // global memory handles, which is what GlobalSize and GlobalLock take.
         // SAFETY: as above, `handle` is a live global memory handle.
         let size = unsafe { GlobalSize(handle) };
         if size == 0 {
@@ -232,5 +253,25 @@ mod tests {
         assert_eq!(got.format, Format::Bmp);
         assert_eq!(got.dimensions(), Some((3, 2)));
         assert_eq!(&got.bytes[14..14 + 40 + 24], &sent.bytes[14..]);
+    }
+
+    #[test]
+    #[ignore = "replaces the contents of this PC's clipboard"]
+    fn clipboard_copied_files() {
+        let paths = [r"C:\Beam test\one.jpg", r"D:\фото\two.png"];
+        // A DROPFILES block as Explorer writes it.
+        let mut block = Vec::new();
+        block.extend_from_slice(&20u32.to_le_bytes());
+        block.extend_from_slice(&[0; 12]);
+        block.extend_from_slice(&1i32.to_le_bytes());
+        for unit in paths.iter().flat_map(|p| p.encode_utf16().chain([0])) {
+            block.extend_from_slice(&unit.to_le_bytes());
+        }
+        block.extend_from_slice(&[0, 0]);
+        Open::new().unwrap().replace(CF_HDROP, &block).unwrap();
+
+        assert_eq!(read_image().unwrap(), None);
+        let got = copied_files().unwrap();
+        assert_eq!(got, paths.map(PathBuf::from));
     }
 }

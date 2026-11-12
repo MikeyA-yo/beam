@@ -590,7 +590,7 @@
     if (!xhr) return;
     const type = xhr.getResponseHeader("Content-Type") || "";
     if (xhr.status === 204 || !xhr.response) {
-      clipSay("Nothing to get. Copy some text or an image on the PC first.", "");
+      clipSay("Nothing to get. Copy some text, an image, or an image file on the PC first.", "");
     } else if (type.startsWith("text/")) {
       const text = await xhr.response.text();
       clipText.value = text;
@@ -673,11 +673,12 @@
         if (xhr.status === 401) {
           expire();
           clipSay("Not connected. Scan the QR code again.", "bad");
-        } else if (xhr.status === 413) {
-          clipSay("That's too large for the clipboard.", "bad");
         } else {
+          // A 413 from the body limit has no message; one from Beam does.
           const msg = parseJson(await xhr.response.text())?.error;
-          clipSay(msg ? capitalize(msg) + "." : `The PC couldn't do that (error ${xhr.status}).`, "bad");
+          if (msg) clipSay(capitalize(msg) + ".", "bad");
+          else if (xhr.status === 413) clipSay("That's too large for the clipboard.", "bad");
+          else clipSay(`The PC couldn't do that (error ${xhr.status}).`, "bad");
         }
         resolve(null);
       });
@@ -713,7 +714,8 @@
     clipImg.src = clipUrl;
     clipSave.href = clipUrl;
     const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "-");
-    clipSave.download = `clipboard-${stamp}.${type.includes("png") ? "png" : "bmp"}`;
+    const ext = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+    clipSave.download = `clipboard-${stamp}.${ext[type.split(";")[0].trim()] || "bmp"}`;
     clipPreview.hidden = false;
   }
 

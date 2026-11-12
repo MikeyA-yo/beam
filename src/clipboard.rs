@@ -8,11 +8,19 @@
 //! clipboard to the thread that opens it, and on Linux (X11) the text we
 //! set only stays pasteable while the arboard handle that set it is alive.
 
+#[cfg(any(windows, test))]
+mod dropfiles;
 mod image;
 #[cfg(windows)]
 mod win;
 
+#[cfg(any(windows, test))]
+use std::fs::{self, File};
+#[cfg(any(windows, test))]
+use std::io::{self, Read};
 use std::net::SocketAddr;
+#[cfg(any(windows, test))]
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 use axum::Json;
@@ -24,7 +32,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-pub use image::{Format, Image, ImageError, MAX_IMAGE_BYTES};
+pub use image::{Format, Image, ImageError, MAX_IMAGE_BYTES, SNIFF_LEN};
 
 use crate::human;
 use crate::server::AppState;
@@ -70,6 +78,14 @@ pub enum ClipboardError {
     BadText,
     #[error("{0}")]
     BadImage(#[from] ImageError),
+    #[error("{0} files are copied on the PC. Copy just one image file")]
+    SeveralFiles(usize),
+    #[error(
+        "the file copied on the PC isn't an image the phone can show (PNG, JPEG, GIF, WebP or BMP)"
+    )]
+    NotAnImage,
+    #[error("could not read the file copied on the PC ({0})")]
+    CopiedFileUnreadable(&'static str),
     #[error("could not use the PC's clipboard ({0})")]
     Failed(String),
     #[error("the clipboard helper stopped")]
@@ -83,6 +99,10 @@ impl ClipboardError {
             Self::ImagesUnsupported | Self::UnsupportedType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::BadImage(ImageError::TooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::BadText | Self::BadImage(_) => StatusCode::BAD_REQUEST,
+            // The request is fine; what's on the PC's clipboard isn't usable.
+            Self::SeveralFiles(_) | Self::NotAnImage | Self::CopiedFileUnreadable(_) => {
+                StatusCode::CONFLICT
+            }
             Self::Failed(_) | Self::Stopped => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -209,7 +229,15 @@ impl Backend for System {
             Err(e) => return Err(from_arboard(e)),
         }
         #[cfg(windows)]
-        return win::read_image().map(|img| img.map(Clip::Image));
+        {
+            if let Some(img) = win::read_image()? {
+                return Ok(Some(Clip::Image(img)));
+            }
+            // Last, a file copied in Explorer, which puts only its path on
+            // the clipboard. The clipboard is closed again by now, so a
+            // slow disk doesn't hold it up for other apps.
+            image_from_copied_files(&win::copied_files()?).map(|img| img.map(Clip::Image))
+        }
         #[cfg(not(windows))]
         return Ok(None);
     }
@@ -223,6 +251,61 @@ impl Backend for System {
             Clip::Image(_) => Err(ClipboardError::ImagesUnsupported),
         }
     }
+}
+
+/// The image in a file copied in Explorer. Only one file is taken, so
+/// what the phone gets is never ambiguous; a folder of photos belongs in
+/// the shared folder instead.
+#[cfg(any(windows, test))]
+fn image_from_copied_files(paths: &[PathBuf]) -> Result<Option<Image>, ClipboardError> {
+    match paths {
+        [] => Ok(None),
+        [path] => read_image_file(path, MAX_IMAGE_BYTES).map(Some),
+        several => Err(ClipboardError::SeveralFiles(several.len())),
+    }
+}
+
+/// Reads an image file, up to `limit` bytes. It's held in memory like any
+/// clipboard image. The file's start is checked first, so a large video
+/// copied by mistake is refused without reading it all.
+#[cfg(any(windows, test))]
+fn read_image_file(path: &Path, limit: usize) -> Result<Image, ClipboardError> {
+    let meta = fs::metadata(path).map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(ClipboardError::NotAnImage);
+    }
+    let mut file = File::open(path).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(SNIFF_LEN as u64)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let format = Format::sniff(&bytes).ok_or(ClipboardError::NotAnImage)?;
+    if meta.len() > limit as u64 {
+        return Err(ImageError::TooLarge.into());
+    }
+    // One byte past the limit, in case the file grew since `metadata`.
+    bytes.reserve(meta.len() as usize);
+    (&mut file)
+        .take((limit + 1 - bytes.len().min(limit)) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() > limit {
+        return Err(ImageError::TooLarge.into());
+    }
+    Ok(Image { format, bytes })
+}
+
+/// For the phone. The OS's message is left to the debug log because it
+/// can include the path.
+#[cfg(any(windows, test))]
+fn unreadable(e: io::Error) -> ClipboardError {
+    tracing::debug!("reading the copied file: {e}");
+    ClipboardError::CopiedFileUnreadable(match e.kind() {
+        io::ErrorKind::NotFound => "it isn't there any more",
+        io::ErrorKind::PermissionDenied => "access denied",
+        _ => "read error",
+    })
 }
 
 fn from_arboard(e: arboard::Error) -> ClipboardError {
@@ -419,6 +502,83 @@ mod tests {
             Err(ClipboardError::Failed(_))
         ));
         assert!(matches!(clipboard.read().await, Err(ClipboardError::Busy)));
+    }
+
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00 and the rest of the photo";
+
+    #[test]
+    fn a_copied_image_file_is_sent_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        // Named .txt on purpose: the content decides, not the name.
+        let path = dir.path().join("photo.txt");
+        fs::write(&path, JPEG).unwrap();
+        let img = image_from_copied_files(&[path]).unwrap().unwrap();
+        assert_eq!(img.format, Format::Jpeg);
+        assert_eq!(img.bytes, JPEG);
+    }
+
+    #[test]
+    fn nothing_copied_means_nothing_to_send() {
+        assert_eq!(image_from_copied_files(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn several_copied_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.jpg");
+        let b = dir.path().join("b.jpg");
+        fs::write(&a, JPEG).unwrap();
+        fs::write(&b, JPEG).unwrap();
+        let err = image_from_copied_files(&[a, b]).unwrap_err();
+        assert!(matches!(err, ClipboardError::SeveralFiles(2)));
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn copied_files_that_arent_images_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.png");
+        fs::write(&notes, "a text file with an image's name").unwrap();
+        let empty = dir.path().join("empty.png");
+        fs::write(&empty, "").unwrap();
+        for path in [notes, empty, dir.path().to_path_buf()] {
+            assert!(
+                matches!(
+                    image_from_copied_files(std::slice::from_ref(&path)),
+                    Err(ClipboardError::NotAnImage)
+                ),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_copied_file_that_is_gone_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = image_from_copied_files(&[dir.path().join("deleted.jpg")]).unwrap_err();
+        assert!(matches!(
+            err,
+            ClipboardError::CopiedFileUnreadable("it isn't there any more")
+        ));
+        // The phone's message never includes the path.
+        assert!(!err.to_string().contains("deleted"));
+    }
+
+    #[test]
+    fn a_copied_image_over_the_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jpg");
+        fs::write(&path, JPEG).unwrap();
+        assert!(read_image_file(&path, JPEG.len()).is_ok());
+        let err = read_image_file(&path, JPEG.len() - 1).unwrap_err();
+        assert!(matches!(
+            err,
+            ClipboardError::BadImage(ImageError::TooLarge)
+        ));
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // A file smaller than the sniffing window works too.
+        assert!(read_image_file(&path, 10_000).is_ok());
     }
 
     /// Replaces this PC's clipboard text, so it only runs on request.
