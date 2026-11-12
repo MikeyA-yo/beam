@@ -95,7 +95,9 @@ cargo test
 cargo run -- --dir ./tmp-share --port 8080
 ```
 
-All three of `fmt`, `clippy`, and `test` must pass before you call a milestone done.
+All three of `fmt`, `clippy`, and `test` must pass before you call a milestone done. CI (`.github/workflows/ci.yml`) runs them on Windows, macOS and Linux for every push.
+
+Releasing: set `version` in `Cargo.toml`, commit, then push a matching tag (`git tag v1.0.0 && git push origin v1.0.0`). `.github/workflows/release.yml` builds with `--profile dist` for each platform and creates a draft GitHub Release to review and publish.
 
 ## Testing expectations
 

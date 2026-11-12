@@ -2,6 +2,13 @@
 name = "beam"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Send files and clipboard between your PC and your phone's browser over Wi-Fi, by scanning a QR code"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MikeyA-yo/beam"
+readme = "README.md"
+keywords = ["file-transfer", "lan", "qr-code", "phone", "clipboard"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -31,3 +38,14 @@ tempfile = "3.27.0"
 # Same version clap and arboard already pull in.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_DataExchange", "Win32_System_Memory"] }
+
+[profile.release]
+strip = true
+
+# The binaries published on GitHub: the whole program optimised together,
+# about a third the size. Too slow to build for everyday `--release` runs.
+# cargo build --profile dist
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
