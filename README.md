@@ -82,7 +82,7 @@ Beam is meant for networks you trust, like your home Wi-Fi or your own hotspot.
 | Windows 10 and 11 | Main platform, tested |
 | macOS, Linux | Built and tested automatically, but less tried in real use. Clipboard images are Windows-only for now; clipboard text works everywhere. |
 | Android (Chrome) | Tested |
-| iPhone (Safari) | Expected to work, not yet tested |
+| iPhone (Safari) | Tested |
 
 ## Building
 
