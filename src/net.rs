@@ -43,7 +43,10 @@ pub fn rank(ifaces: Vec<(String, IpAddr)>) -> Vec<Ipv4Addr> {
             continue;
         }
         let lname = name.to_lowercase();
-        let is_virtual = VIRTUAL_HINTS.iter().any(|h| lname.contains(h));
+        // This PC's own hotspot, if it's on. Only phones on that hotspot
+        // can use it, and Beam shows it separately for them.
+        let is_own_hotspot = v4.octets()[..3] == [192, 168, 137];
+        let is_virtual = is_own_hotspot || VIRTUAL_HINTS.iter().any(|h| lname.contains(h));
         found.push((is_virtual, range_rank(v4), v4));
     }
     // Stable sort keeps the OS order within a bucket.
@@ -102,6 +105,17 @@ mod tests {
         ]);
         assert_eq!(got[0], "10.1.2.3".parse::<Ipv4Addr>().unwrap());
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn this_pcs_own_hotspot_goes_last() {
+        // Its adapter has an ordinary-looking name ("Local Area Connection* 2").
+        let got = rank(vec![
+            ("Local Area Connection* 2".into(), v4("192.168.137.1")),
+            ("Wi-Fi".into(), v4("10.170.132.127")),
+        ]);
+        assert_eq!(got[0], "10.170.132.127".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(got[1], "192.168.137.1".parse::<Ipv4Addr>().unwrap());
     }
 
     #[test]

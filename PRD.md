@@ -6,7 +6,7 @@ Browser-based local file sharing between a PC and a phone. The PC runs a single 
 |---|---|
 | Owner | Ay |
 | Status | Draft |
-| Version | v1 (files), v1.1 (clipboard on request), v1.2 (share from anywhere on the PC) |
+| Version | v1 (files), v1.1 (clipboard on request), v1.2 (share from anywhere on the PC), v1.3 (direct connection through the PC's hotspot) |
 | Primary setup | HP laptop on Windows + Android phone (Chrome) |
 
 ## 1. Problem
@@ -113,6 +113,17 @@ The PC's own drive may be short on space, for example when sending a film from a
 - **FR-34:** The page lists earlier folders of this run to switch back with one click, and the files shared from elsewhere with a **Stop sharing** button.
 - **FR-35:** Only the PC itself can see or change what's shared: those routes answer requests from the loopback address only, so a phone with a valid cookie gets 403. They take JSON only, so another website can't send them without a CORS preflight. The phone page shows the shared folder's name, never its full path.
 
+### 6.9 Direct connection through the PC's hotspot (v1.3)
+
+Through a router, every byte crosses the air twice on one shared channel, often 2.4 GHz. Phone straight to PC crosses once, and can use 5 GHz. Flash-transfer apps and AirDrop work this way; a browser can't create a direct Wi-Fi link, but the PC can be the hotspot.
+
+- **FR-36:** On Windows, the PC's QR page offers **Same Wi-Fi** (FR-4a) or **Direct to this PC**. Direct turns on Windows Mobile Hotspot and shows two numbered steps: a Wi-Fi QR code (`WIFI:T:WPA;S:...;P:...;;`, which phone cameras offer to join) with the network name and password, then the Beam QR code for `192.168.137.1`, the address Windows always gives the PC on its hotspot.
+- **FR-37:** `beam --hotspot` does this at startup and prints both QR codes in the terminal, for people who start Beam from a shortcut. If the hotspot can't start, Beam says why and carries on with the normal connection.
+- **FR-38:** Beam keeps the hotspot's existing name and password. It asks for 5 GHz when the hardware supports it, and keeps Windows from turning the hotspot off while no device has joined yet. Both are put back when the hotspot is turned off. A PC whose own Wi-Fi is on 2.4 GHz may still get 2.4 GHz; the page says so instead of promising 5 GHz.
+- **FR-39:** When Beam stops (Ctrl+C or closing its window), it turns the hotspot off if Beam turned it on, and leaves it alone otherwise.
+- **FR-40:** Same PC-only rule as FR-35: the hotspot routes answer the loopback address only and take JSON only. The password is shown on the PC's screen and in the QR code, never logged.
+- **FR-41:** Windows treats the hotspot as a public network, so the page tells people to allow Beam through the firewall on public networks too.
+
 ## 7. Non-functional requirements
 
 - **Single binary:** HTML, CSS, and JS are embedded in the binary. The page loads no external CDN, font, or script, because the phone may have no internet.
@@ -136,6 +147,9 @@ The PC's own drive may be short on space, for example when sending a film from a
 | GET | `/api/share` | The shared folder, earlier folders and files shared from elsewhere; PC only (FR-35) |
 | PUT | `/api/share/folder` | Switch the shared folder, JSON `{"path": ...}`; PC only (FR-33) |
 | DELETE | `/api/share/files/{id}` | Stop sharing a file from elsewhere; PC only (FR-34) |
+| GET | `/api/hotspot` | Whether the PC's hotspot is on, with its network, password and both QR codes; PC only (FR-36) |
+| POST | `/api/hotspot/start` | Turn the PC's hotspot on (JSON body `{}`); PC only (FR-36, FR-38) |
+| POST | `/api/hotspot/stop` | Turn it off and restore its settings (JSON body `{}`); PC only (FR-38) |
 | GET | `/api/clipboard` | The PC's clipboard: text or an image (PNG, JPEG, GIF, WebP or BMP) by `Content-Type`; 204 if empty, 409 with a message if a copied file can't be sent (FR-27, FR-29) |
 | PUT | `/api/clipboard` | Set the PC's clipboard from `text/plain` or `image/bmp` (FR-26, FR-28) |
 
@@ -181,6 +195,7 @@ v1 is done when all of these pass on the real setup (Windows laptop + Android ph
 5. **M5:** UI polish (progress, speed, errors), logging, and the acceptance pass above.
 6. **M6 (v1.1):** clipboard text both ways, and images both ways on Windows (section 6.7).
 7. **M7 (v1.2):** files served in place, and switching the shared folder from the PC while running (section 6.8).
+8. **M8 (v1.3):** direct connection through the PC's hotspot, on the page and with `--hotspot` (section 6.9).
 
 ## 13. Future (v2 and beyond)
 
@@ -190,7 +205,8 @@ v1 is done when all of these pass on the real setup (Windows laptop + Android ph
 - A PC-side web page with drag and drop
 - Folder uploads and zipped multi-file downloads
 - System tray app on Windows and a right-click "Send to phone" entry
-- A native phone companion (Termux + Go, or a thin Android app around the same protocol)
+- A native phone companion (Termux + Go, or a thin Android app around the same protocol), using Wi-Fi Direct for a direct 5 GHz link
+- Quick Share compatibility, so Android's own share sheet can send to Beam (unofficial protocol; see `rquickshare`, `NearDrop`)
 
 ## 14. Open questions
 

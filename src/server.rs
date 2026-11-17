@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, watch};
 use crate::clipboard::{self, Clipboard};
 use crate::config::SharedDir;
 use crate::events::{self, Event};
+use crate::hotspot::{self, Hotspot};
 use crate::share::{self, Share};
 use crate::{auth, files, human, qr, socket, upload, watcher};
 
@@ -44,6 +45,8 @@ pub struct AppState {
     /// codes on `/qr`.
     pub phone_urls: Arc<Vec<String>>,
     pub clipboard: Clipboard,
+    /// This PC's Wi-Fi hotspot, for connecting the phone directly.
+    pub hotspot: Arc<Hotspot>,
     /// Flips to `true` on Ctrl+C so long-lived tasks (WebSockets, the
     /// watcher) stop on their own instead of holding up the shutdown.
     shutdown: Arc<watch::Sender<bool>>,
@@ -59,8 +62,14 @@ impl AppState {
             events: events::channel(),
             phone_urls: Arc::new(Vec::new()),
             clipboard: Clipboard::system(),
+            hotspot: Arc::new(Hotspot::new(String::new())),
             shutdown: Arc::new(watch::channel(false).0),
         }
+    }
+
+    pub fn with_hotspot(mut self, hotspot: Hotspot) -> Self {
+        self.hotspot = Arc::new(hotspot);
+        self
     }
 
     pub fn with_phone_urls(mut self, urls: Vec<String>) -> Self {
@@ -142,6 +151,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/share", get(share::get_handler))
         .route("/api/share/folder", put(share::folder_handler))
         .route("/api/share/files/{id}", delete(share::remove_handler))
+        // The PC's own hotspot: from the PC itself only, too.
+        .route("/api/hotspot", get(hotspot::get_handler))
+        .route("/api/hotspot/start", post(hotspot::start_handler))
+        .route("/api/hotspot/stop", post(hotspot::stop_handler))
         .route("/ws", get(events::ws_handler))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(

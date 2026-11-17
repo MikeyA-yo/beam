@@ -78,6 +78,38 @@
   .hint { margin: 20px 0 0; color: var(--muted); font-size: 0.85rem; }
   .none { color: var(--muted); }
 
+  /* Same Wi-Fi or Direct. */
+  .modes { display: inline-flex; gap: 4px; padding: 4px; margin: 4px 0 16px; border: 1px solid var(--border); border-radius: 999px; }
+  .modes button {
+    min-height: 36px; padding: 4px 14px; border: 0; border-radius: 999px;
+    background: transparent; color: var(--text); font: inherit; font-size: 0.9rem; cursor: pointer;
+  }
+  .modes button[aria-selected="true"] { background: var(--accent); color: #fff; font-weight: 600; }
+  .fast { font-size: 0.75rem; opacity: 0.85; }
+  button.big {
+    min-height: 48px; padding: 10px 22px; border: 0; border-radius: 12px;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.big:disabled, #hotspot-off:disabled { opacity: 0.6; cursor: default; }
+  #hotspot-off {
+    margin-top: 12px; min-height: 40px; padding: 6px 16px; border: 1px solid var(--border);
+    border-radius: 10px; background: transparent; color: var(--text); font: inherit; cursor: pointer;
+  }
+  .steps { list-style: none; counter-reset: step; margin: 0; padding: 0; display: grid; gap: 20px; }
+  .steps li { counter-increment: step; }
+  .steps h2 { font-size: 1.05rem; margin: 0 0 4px; }
+  .steps h2::before {
+    content: counter(step); display: inline-grid; place-items: center;
+    width: 1.6em; height: 1.6em; margin-right: 8px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 0.85rem;
+  }
+  .steps p { margin: 0 0 10px; color: var(--muted); font-size: 0.9rem; }
+  .steps .qr svg { width: min(100%, 260px); }
+  .creds { display: grid; grid-template-columns: auto auto; justify-content: center; gap: 2px 12px; margin: 10px 0 0; }
+  .creds dt { color: var(--muted); text-align: right; }
+  .creds dd { margin: 0; text-align: left; font: 0.95rem ui-monospace, "Cascadia Mono", Consolas, monospace; user-select: all; }
+  #direct-status { min-height: 1.4em; margin: 10px 0 0; font-size: 0.9rem; color: #e5484d; }
+
   /* What's shared. Left-aligned: paths read better that way. */
   #share { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); text-align: left; }
   #share h2 { font-size: 1.05rem; margin: 0 0 4px; }
@@ -127,13 +159,58 @@
 <body>
 <main>
   <h1>Scan with your phone</h1>
+  <div class="modes" id="modes" role="tablist" hidden>
+    <button type="button" role="tab" id="tab-wifi" aria-selected="true">Same Wi-Fi</button>
+    <button type="button" role="tab" id="tab-direct" aria-selected="false">Direct to this PC <span class="fast">faster</span></button>
+  </div>
+
+  <div id="mode-wifi">
   <p class="lead">Open the phone's camera, point it at the code, and tap the link.</p>
   {{CODES}}
   <p class="hint">
     Phone and PC must be on the same Wi-Fi. If the page won't open, allow Beam through
-    Windows Firewall on private networks, set the Wi-Fi profile to Private, or connect this
-    PC to the phone's hotspot. This code works until Beam stops.
+    Windows Firewall on private networks, set the Wi-Fi profile to Private, or try
+    <b>Direct to this PC</b> above. This code works until Beam stops.
   </p>
+  </div>
+
+  <div id="mode-direct" hidden>
+    <div id="direct-off">
+      <p class="lead">
+        This PC makes its own Wi-Fi network and the phone joins it. Files then go
+        straight between them instead of through a router, which is usually much faster.
+      </p>
+      <button type="button" class="big" id="hotspot-on">Turn on this PC's hotspot</button>
+    </div>
+    <div id="direct-on" hidden>
+      <ol class="steps">
+        <li>
+          <h2>Join this PC's Wi-Fi</h2>
+          <p>Scan with the phone's camera and tap <b>Join</b>, or join it in Wi-Fi settings.</p>
+          <figure class="qr" id="wifi-qr"></figure>
+          <dl class="creds">
+            <dt>Network</dt><dd id="wifi-ssid"></dd>
+            <dt>Password</dt><dd id="wifi-pass"></dd>
+          </dl>
+        </li>
+        <li>
+          <h2>Then open Beam</h2>
+          <p>Once the phone is on that Wi-Fi, scan this and tap the link.</p>
+          <figure class="qr" id="beam-qr"></figure>
+          <figcaption id="beam-url"></figcaption>
+        </li>
+      </ol>
+      <p class="hint" id="direct-band"></p>
+      <button type="button" class="plain" id="hotspot-off">Turn the hotspot off</button>
+    </div>
+    <p id="direct-status" aria-live="polite"></p>
+    <p class="hint">
+      Phone joined but Beam won't open? Windows counts this hotspot as a public network:
+      allow Beam through Windows Firewall on <b>public</b> networks too. If this PC gets its
+      internet from your phone's hotspot, you're already connected directly: set the
+      phone's hotspot to 5 GHz instead.
+    </p>
+  </div>
 
   <!-- Only shown on this PC: the server refuses these requests from the phone. -->
   <section id="share" hidden>
@@ -163,6 +240,82 @@
       for (const b of document.querySelectorAll("[data-pick]")) b.setAttribute("aria-pressed", String(b === button));
     });
   }
+
+  // ---- Same Wi-Fi or Direct (this PC's hotspot) ----
+
+  const tabs = { wifi: document.getElementById("tab-wifi"), direct: document.getElementById("tab-direct") };
+  const panels = { wifi: document.getElementById("mode-wifi"), direct: document.getElementById("mode-direct") };
+  const hotspotOn = document.getElementById("hotspot-on");
+  const hotspotOff = document.getElementById("hotspot-off");
+  const directStatus = document.getElementById("direct-status");
+  let hotspotBusy = false;
+
+  function showMode(mode) {
+    for (const m of ["wifi", "direct"]) {
+      tabs[m].setAttribute("aria-selected", String(m === mode));
+      panels[m].hidden = m !== mode;
+    }
+  }
+  tabs.wifi.addEventListener("click", () => showMode("wifi"));
+  tabs.direct.addEventListener("click", () => showMode("direct"));
+
+  // The QR codes are SVG made by Beam itself; everything else is text.
+  function renderHotspot(info) {
+    const n = info.network;
+    document.getElementById("direct-off").hidden = info.on;
+    document.getElementById("direct-on").hidden = !info.on;
+    if (!n) return;
+    document.getElementById("wifi-qr").innerHTML = n.wifi_qr;
+    document.getElementById("beam-qr").innerHTML = n.beam_qr;
+    document.getElementById("wifi-ssid").textContent = n.ssid;
+    document.getElementById("wifi-pass").textContent = n.password;
+    document.getElementById("beam-url").textContent = n.beam_url;
+    // Windows reports the band it was asked for, not the one it got: a PC
+    // whose own Wi-Fi is on 2.4 GHz may have to keep the hotspot there too.
+    document.getElementById("direct-band").textContent = `Set to ${n.band}. ` +
+      "If this PC is itself on 2.4 GHz Wi-Fi, Windows may have to use 2.4 GHz anyway; " +
+      "connecting the PC by cable or to 5 GHz Wi-Fi lets the hotspot use 5 GHz.";
+  }
+
+  async function hotspot(action, busyText) {
+    if (hotspotBusy) return;
+    hotspotBusy = true;
+    hotspotOn.disabled = hotspotOff.disabled = true;
+    directStatus.textContent = "";
+    const label = hotspotOn.textContent;
+    if (action === "start") hotspotOn.textContent = busyText;
+    try {
+      const res = await fetch("/api/hotspot/" + action, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      const json = await res.json().catch(() => null);
+      if (res.ok && json) renderHotspot(json);
+      else {
+        const msg = json && json.error ? json.error : `error ${res.status}`;
+        directStatus.textContent = msg.charAt(0).toUpperCase() + msg.slice(1) + ".";
+      }
+    } catch {
+      directStatus.textContent = "Beam isn't responding. Is it still running?";
+    } finally {
+      hotspotBusy = false;
+      hotspotOn.disabled = hotspotOff.disabled = false;
+      hotspotOn.textContent = label;
+    }
+  }
+  hotspotOn.addEventListener("click", () => hotspot("start", "Turning on…"));
+  hotspotOff.addEventListener("click", () => hotspot("stop"));
+
+  // Only on this PC, and only where Beam can make a hotspot. If it's on
+  // already (beam --hotspot), go straight to the steps.
+  fetch("/api/hotspot", { cache: "no-store" })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((info) => {
+      if (!info || !info.supported) return;
+      document.getElementById("modes").hidden = false;
+      renderHotspot(info);
+      if (info.on) showMode("direct");
+    })
+    .catch(() => {});
 
   // ---- What's shared ----
 

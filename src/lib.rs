@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod config;
 pub mod events;
 pub mod files;
+pub mod hotspot;
 mod human;
 pub mod net;
 mod qr;

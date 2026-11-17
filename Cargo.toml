@@ -38,6 +38,9 @@ tempfile = "3.27.0"
 # Same version clap and arboard already pull in.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_DataExchange", "Win32_System_Memory"] }
+# Windows Mobile Hotspot in src/hotspot.rs. It's a WinRT API, which only the
+# full `windows` crate covers; its bindings are safe, so no `unsafe` here.
+windows = { version = "0.62.2", features = ["Foundation", "Foundation_Collections", "Networking_Connectivity", "Networking_NetworkOperators"] }
 
 [profile.release]
 strip = true

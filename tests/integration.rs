@@ -1419,3 +1419,74 @@ async fn the_pc_can_stop_sharing_a_file_from_elsewhere() {
     // The file itself is untouched.
     assert_eq!(std::fs::read(&movie).unwrap(), b"frames");
 }
+
+// ---- The PC's own hotspot ----
+
+#[tokio::test]
+async fn hotspot_routes_need_the_cookie_and_json() {
+    let s = TestServer::start().await;
+    for (method, path) in [
+        (reqwest::Method::GET, "/api/hotspot"),
+        (reqwest::Method::POST, "/api/hotspot/start"),
+        (reqwest::Method::POST, "/api/hotspot/stop"),
+    ] {
+        let res = s.client.request(method, s.url(path)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // A plain form post, as another website could send: refused before
+    // anything touches the PC's hotspot.
+    for path in ["/api/hotspot/start", "/api/hotspot/stop"] {
+        let res = s
+            .client
+            .post(s.url(path))
+            .header(COOKIE, s.cookie())
+            .header(CONTENT_TYPE, "text/plain")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn hotspot_status_is_reported_without_changing_anything() {
+    let s = TestServer::start().await;
+    let res = s.get("/api/hotspot").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let info = json_body(res).await;
+    assert_eq!(info["supported"], cfg!(windows));
+    assert_eq!(info["turned_on_by_beam"], false);
+    assert!(info["on"].is_boolean());
+}
+
+/// Turns this PC's real hotspot on and off, so it only runs on request:
+/// `cargo test -- --ignored hotspot`.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "turns this PC's Wi-Fi hotspot on and off"]
+async fn hotspot_turns_on_and_back_off() {
+    let s = TestServer::start().await;
+    let post = |path: &'static str| {
+        s.client
+            .post(s.url(path))
+            .header(COOKIE, s.cookie())
+            .header(CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send()
+    };
+    let res = post("/api/hotspot/start").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let on = json_body(res).await;
+    assert_eq!(on["on"], true);
+    assert!(
+        on["network"]["wifi_qr"]
+            .as_str()
+            .unwrap()
+            .starts_with("<svg")
+    );
+
+    let res = post("/api/hotspot/stop").await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(json_body(res).await["on"], false);
+}

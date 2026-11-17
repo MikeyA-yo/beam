@@ -6,11 +6,11 @@ Instructions for any AI coding agent working in this repo. Read `PRD.md` first; 
 
 ## Project in one paragraph
 
-Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files; v1.1 adds clipboard sharing on request (text on every platform, images on Windows). v1.2 serves files from anywhere on the PC without copying, and lets the PC switch the shared folder while running. No HTTPS, no mobile app.
+Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files; v1.1 adds clipboard sharing on request (text on every platform, images on Windows). v1.2 serves files from anywhere on the PC without copying, and lets the PC switch the shared folder while running. v1.3 can turn the PC into a Wi-Fi hotspot so the phone connects to it directly. No HTTPS, no mobile app.
 
 ## Working style
 
-- Work milestone by milestone (M1 to M7 in the PRD). Finish and verify one before starting the next.
+- Work milestone by milestone (M1 to M8 in the PRD). Finish and verify one before starting the next.
 - Before writing code for a milestone, state briefly what you plan to change and which files you will touch.
 - Keep changes small and reviewable. Do not refactor unrelated code.
 - Do not add features outside v1 scope, even if they seem easy. If something seems missing from the PRD, ask instead of inventing it.
@@ -36,6 +36,7 @@ Rust stable, 2021 edition or newer. Expected crates (check crates.io for current
 - `anyhow` in `main`, `thiserror` for typed errors in modules
 - `arboard` (default features off, so text only) for clipboard text
 - `windows-sys`, Windows only, for `SO_EXCLUSIVEADDRUSE` and clipboard images. Its `unsafe` stays in `socket.rs` and `clipboard/win.rs`, with a `SAFETY` comment on every block.
+- `windows`, Windows only, for Windows Mobile Hotspot (a WinRT API) in `hotspot.rs`. Its bindings are safe; no `unsafe` there.
 - Dev only: `reqwest` and `tempfile` for integration tests
 
 ## Suggested layout
@@ -52,6 +53,7 @@ src/
   watcher.rs     folder watching, emits events
   sanitize.rs    filename sanitization and path containment
   share.rs       the shared folder (switchable from the PC only), files shared in place
+  hotspot.rs     the PC's Wi-Fi hotspot for a direct connection (Windows), PC only
   clipboard.rs   clipboard thread, backends, /api/clipboard handlers
   clipboard/     image.rs (image format helpers), dropfiles.rs (files copied in Explorer),
                  win.rs (Windows clipboard images)
@@ -116,4 +118,4 @@ Releasing: set `version` in `Cargo.toml`, commit, then push a matching tag (`git
 
 ## Out of scope for v1 (do not build)
 
-Automatic clipboard sync, files on the clipboard (other than a single copied image file), HTTPS, PWA or service workers, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.
+Automatic clipboard sync, files on the clipboard (other than a single copied image file), HTTPS, PWA or service workers, Wi-Fi Direct or Quick Share, mDNS, persistent pairing, internet relay, folder uploads, zip downloads, a tray app, and any mobile app. These are listed under Future in the PRD.

@@ -9,6 +9,7 @@ Send files between your PC and your phone over Wi-Fi. Run Beam on the PC, scan t
 - **Phone to PC:** pick files on the phone; they land in a folder on the PC, with a progress bar for each.
 - **PC to phone:** files in that folder show up on the phone, ready to download. The list updates live as files are added.
 - **Share from anywhere, without copying.** Switch the shared folder while Beam runs, or share single files from another drive. Nothing is copied onto the PC, which matters when its disk is full.
+- **Direct connection, no router needed (Windows).** Beam can turn the PC into a Wi-Fi hotspot that the phone joins by scanning a code, so files go straight between them. Usually much faster than through a router.
 - **Big files are fine.** Files are streamed to and from disk, never held in memory, so a multi-gigabyte video transfers like a small one. Downloads can resume.
 - **Clipboard on request:** send text or an image to the PC's clipboard, or tap **Get from PC** to fetch what's on it: text, a screenshot, or an image file copied in Explorer. Beam never sends the PC's clipboard unless you tap.
 - **One small program.** The phone page is built into it, and it works with no internet connection.
@@ -55,7 +56,21 @@ beam [OPTIONS] [FILES]...
 | `beam --dir D:\Transfers` | Share a different folder |
 | `beam --port 9000` | Use a different port. If the port is taken, Beam tries the next few on its own. |
 | `beam --no-open` | Don't open the QR code page in the browser; the terminal QR code is enough |
+| `beam --hotspot` | Windows: turn this PC into a Wi-Fi hotspot and connect the phone straight to it (see below). Handy in a desktop shortcut. |
 | `beam --help` | Show all options |
+
+### Connect the phone directly (Windows)
+
+On the page that opens in your PC's browser, pick **Direct to this PC** and click **Turn on this PC's hotspot**, or start Beam with `beam --hotspot`. Then, on the phone:
+
+1. Scan the first QR code with the camera and tap **Join**. The phone joins the PC's own Wi-Fi.
+2. Scan the second QR code to open Beam.
+
+Files then go straight between phone and PC instead of through a router, so every byte crosses the air once instead of twice, and Beam asks Windows for the faster 5 GHz band. Beam uses your Windows hotspot's existing name and password, and turns the hotspot off again when it stops (if it turned it on).
+
+- **Speed depends on the band.** If the PC's own Wi-Fi is on 2.4 GHz, Windows may have to run the hotspot on 2.4 GHz too. Connecting the PC by cable, or to 5 GHz Wi-Fi, lets the hotspot use 5 GHz.
+- **Already on your phone's hotspot?** Then the PC and phone are already connected directly. For more speed, set the phone's hotspot to 5 GHz in its hotspot settings.
+- **Phone joined but Beam won't open?** Windows treats the hotspot as a public network. Allow Beam through Windows Firewall on **public** networks too.
 
 ### Share another folder without restarting
 
@@ -69,7 +84,8 @@ Beam never overwrites anything: if a file with the same name exists, the new one
 
 - **Same network.** The phone and the PC must be on the same Wi-Fi.
 - **Firewall.** On Windows, allow Beam through Windows Firewall on private networks, and make sure the Wi-Fi network is set to **Private**, not Public (Settings → Network & internet → Wi-Fi → your network).
-- **Networks that block devices from seeing each other**, common on campus, hotel and office Wi-Fi. Turn on your phone's hotspot and connect the PC to it instead. Beam works the same way, and the transfer doesn't use mobile data.
+- **Networks that block devices from seeing each other**, common on campus, hotel and office Wi-Fi. Use **Direct to this PC** (Windows), or turn on your phone's hotspot and connect the PC to it. Beam works the same way, and the transfer doesn't use mobile data.
+- **Slow transfers?** Check the PC's Wi-Fi band: 2.4 GHz manages a few MB/s at best, 5 GHz several times that. Use 5 GHz Wi-Fi, a cable for the PC, or the direct connection above.
 - **Several network adapters** (VPN, virtual machines). Beam prints every address it finds, and the browser page lets you switch between their QR codes. Try another one.
 
 ## Security
