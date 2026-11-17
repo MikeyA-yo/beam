@@ -1,8 +1,11 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use beam::config::SharedDir;
 use beam::server::{self, AppState};
+use beam::share::{Added, Share};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use tempfile::TempDir;
@@ -17,6 +20,7 @@ struct TestServer {
     dir: TempDir,
     /// Stands in for the PC's clipboard, which tests must never touch.
     clipboard: beam::clipboard::Memory,
+    share: Arc<Share>,
 }
 
 impl TestServer {
@@ -29,9 +33,14 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let token = beam::config::generate_token();
         let clipboard = beam::clipboard::Memory::default();
-        let state = AppState::new(token.clone(), dir.path().canonicalize().unwrap())
+        let folder = SharedDir {
+            display: dir.path().to_path_buf(),
+            canonical: dir.path().canonicalize().unwrap(),
+        };
+        let state = AppState::new(token.clone(), folder)
             .with_phone_urls(urls(&token))
             .with_clipboard(beam::clipboard::Clipboard::with_backend(clipboard.clone()));
+        let share = state.share.clone();
         // Ends with the test's runtime.
         beam::watcher::start(state.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -55,6 +64,7 @@ impl TestServer {
             client,
             dir,
             clipboard,
+            share,
         }
     }
 
@@ -1226,4 +1236,186 @@ async fn clipboard_accepts_images_over_two_megabytes() {
     let res = s.put_clipboard("image/bmp", image.clone()).await;
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     assert!(matches!(s.clipboard.get(), Some(Clip::Image(img)) if img.bytes == image));
+}
+
+// ---- Sharing from elsewhere, and switching folders ----
+
+impl TestServer {
+    async fn set_folder(&self, path: &Path) -> reqwest::Response {
+        let body = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+        self.client
+            .put(self.url("/api/share/folder"))
+            .header(COOKIE, self.cookie())
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn listing(&self) -> serde_json::Value {
+        let res = self.get("/api/files").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        json_body(res).await
+    }
+}
+
+async fn json_body(res: reqwest::Response) -> serde_json::Value {
+    serde_json::from_slice(&res.bytes().await.unwrap()).unwrap()
+}
+
+fn listed_names(listing: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = listing["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_file_from_elsewhere_is_served_in_place_with_ranges() {
+    let s = TestServer::start().await;
+    let ssd = tempfile::tempdir().unwrap();
+    let movie = ssd.path().join("movie.mkv");
+    let data = sample(100_000);
+    std::fs::write(&movie, &data).unwrap();
+    assert!(matches!(
+        s.share.add_file(&movie).unwrap(),
+        Added::Shared(_)
+    ));
+
+    assert_eq!(listed_names(&s.listing().await), ["movie.mkv"]);
+    let res = s.get("/api/files/movie.mkv").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(header(&res, "content-disposition").contains("movie.mkv"));
+    assert_eq!(res.bytes().await.unwrap(), data);
+
+    let res = s.get_range("/api/files/movie.mkv", "bytes=1000-1999").await;
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.bytes().await.unwrap(), data[1000..2000]);
+
+    // Nothing was copied or linked into the shared folder.
+    assert!(s.files().is_empty());
+}
+
+#[tokio::test]
+async fn switching_folders_moves_the_listing_uploads_and_downloads() {
+    let s = TestServer::start().await;
+    s.put("old.txt", b"before", 60);
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("new.txt"), b"after").unwrap();
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+
+    let res = s.set_folder(other.path()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let info = json_body(res).await;
+    assert_eq!(info["folder"], *other.path().to_string_lossy());
+    assert_eq!(info["recent"][0], *s.path().to_string_lossy());
+
+    // Every page is told to refetch.
+    ws.expect("resync", |v| v["type"] == "resync").await;
+    let listing = s.listing().await;
+    assert_eq!(listed_names(&listing), ["new.txt"]);
+    let other_name = other.path().file_name().unwrap().to_string_lossy();
+    assert_eq!(listing["folder"], *other_name);
+
+    // Downloads come from the new folder only.
+    assert_eq!(
+        s.get("/api/files/old.txt").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    let res = s.get("/api/files/new.txt").await;
+    assert_eq!(res.bytes().await.unwrap(), &b"after"[..]);
+
+    // Uploads land in the new folder; the old one is left alone.
+    s.upload_one("phone.jpg", b"jpeg").await;
+    assert_eq!(
+        std::fs::read(other.path().join("phone.jpg")).unwrap(),
+        b"jpeg"
+    );
+    assert_eq!(s.files(), ["old.txt"]);
+
+    // And the new folder is watched: a file dropped into it is announced.
+    std::fs::write(other.path().join("dropped.pdf"), b"pdf").unwrap();
+    ws.expect("file_added", |v| is_event(v, "file_added", "dropped.pdf"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_missing_folder_is_refused_and_nothing_changes() {
+    let s = TestServer::start().await;
+    s.put("keep.txt", b"x", 60);
+    let typo = s.path().join("no such folder");
+
+    let res = s.set_folder(&typo).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(res).await["error"], "that folder doesn't exist");
+    assert!(!typo.exists(), "a typo must not create a folder");
+    assert_eq!(listed_names(&s.listing().await), ["keep.txt"]);
+}
+
+#[tokio::test]
+async fn changing_the_share_needs_the_cookie_and_json() {
+    let s = TestServer::start().await;
+    let other = tempfile::tempdir().unwrap();
+    for (method, path) in [
+        (reqwest::Method::GET, "/api/share"),
+        (reqwest::Method::PUT, "/api/share/folder"),
+        (reqwest::Method::DELETE, "/api/share/files/0"),
+    ] {
+        let res = s.client.request(method, s.url(path)).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    // A plain form post, as another website could send without asking.
+    let res = s
+        .client
+        .put(s.url("/api/share/folder"))
+        .header(COOKIE, s.cookie())
+        .header(CONTENT_TYPE, "text/plain")
+        .body(format!(
+            r#"{{"path":{:?}}}"#,
+            other.path().to_string_lossy()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(s.share.dir(), s.path().canonicalize().unwrap());
+}
+
+#[tokio::test]
+async fn the_pc_can_stop_sharing_a_file_from_elsewhere() {
+    let s = TestServer::start().await;
+    let ssd = tempfile::tempdir().unwrap();
+    let movie = ssd.path().join("movie.mkv");
+    std::fs::write(&movie, b"frames").unwrap();
+    let Added::Shared(extra) = s.share.add_file(&movie).unwrap() else {
+        panic!("expected the file to be shared");
+    };
+
+    let info = json_body(s.get("/api/share").await).await;
+    assert_eq!(info["files"][0]["name"], "movie.mkv");
+    assert_eq!(info["files"][0]["path"], *movie.to_string_lossy());
+
+    let mut ws = WsClient::connect(&s, Some(s.cookie())).await.unwrap();
+    let remove = || {
+        s.client
+            .delete(s.url(&format!("/api/share/files/{}", extra.id)))
+            .header(COOKIE, s.cookie())
+            .send()
+    };
+    assert_eq!(remove().await.unwrap().status(), StatusCode::OK);
+    ws.expect("resync", |v| v["type"] == "resync").await;
+    assert!(listed_names(&s.listing().await).is_empty());
+    assert_eq!(
+        s.get("/api/files/movie.mkv").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(remove().await.unwrap().status(), StatusCode::NOT_FOUND);
+    // The file itself is untouched.
+    assert_eq!(std::fs::read(&movie).unwrap(), b"frames");
 }

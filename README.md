@@ -8,6 +8,7 @@ Send files between your PC and your phone over Wi-Fi. Run Beam on the PC, scan t
 
 - **Phone to PC:** pick files on the phone; they land in a folder on the PC, with a progress bar for each.
 - **PC to phone:** files in that folder show up on the phone, ready to download. The list updates live as files are added.
+- **Share from anywhere, without copying.** Switch the shared folder while Beam runs, or share single files from another drive. Nothing is copied onto the PC, which matters when its disk is full.
 - **Big files are fine.** Files are streamed to and from disk, never held in memory, so a multi-gigabyte video transfers like a small one. Downloads can resume.
 - **Clipboard on request:** send text or an image to the PC's clipboard, or tap **Get from PC** to fetch what's on it: text, a screenshot, or an image file copied in Explorer. Beam never sends the PC's clipboard unless you tap.
 - **One small program.** The phone page is built into it, and it works with no internet connection.
@@ -50,11 +51,17 @@ beam [OPTIONS] [FILES]...
 | Command | What it does |
 |---|---|
 | `beam` | Share `Downloads/Beam` on port 8080 |
-| `beam photo.jpg report.pdf` | Also offer these files to the phone. They're added to the shared folder, hard-linked when possible so it's instant and takes no extra space. |
+| `beam E:\Movies\film.mkv` | Also offer these files to the phone, from wherever they are: another drive, an external SSD. They're served in place, never copied. |
 | `beam --dir D:\Transfers` | Share a different folder |
 | `beam --port 9000` | Use a different port. If the port is taken, Beam tries the next few on its own. |
 | `beam --no-open` | Don't open the QR code page in the browser; the terminal QR code is enough |
 | `beam --help` | Show all options |
+
+### Share another folder without restarting
+
+The page that opens in your PC's browser, under the QR code, has a **Shared folder** box. Paste a folder path (in File Explorer, right-click the folder and choose **Copy as path**) and click **Share**. The phone's list switches straight away, uploads go to the new folder, and the phone stays connected. Folders you shared earlier are listed there to switch back with one click, along with any files shared from elsewhere and a **Stop sharing** button for each.
+
+Only the PC can do this. The phone can't change or even see which folder is shared, beyond its name.
 
 Beam never overwrites anything: if a file with the same name exists, the new one is saved as `name (1).ext`. A transfer that's cut off leaves no partial file behind.
 
@@ -71,7 +78,7 @@ Beam is meant for networks you trust, like your home Wi-Fi or your own hotspot.
 
 - **Only someone with the QR code can connect.** It carries a random key, which is new every time Beam starts. The phone keeps it as a login cookie for at most 24 hours, and it stops working as soon as Beam stops.
 - **The connection is not encrypted.** Beam uses plain HTTP, so someone on the same network who can watch its traffic could see the files you send. Avoid public Wi-Fi, or use your phone's hotspot.
-- **Only the shared folder is exposed.** File names from the phone are cleaned, so they can't escape the folder or overwrite files, and downloads can't reach anything outside it.
+- **Only what you share is exposed:** the shared folder, and any single files you add. File names from the phone are cleaned, so they can't escape the folder or overwrite files, and downloads can't reach anything else. Only the PC itself can change what's shared, never the phone.
 - **The clipboard is read only when you tap Get from PC.** Its contents never appear in Beam's log; only the type and size do.
 - **Beam makes no internet connections and collects no data.**
 

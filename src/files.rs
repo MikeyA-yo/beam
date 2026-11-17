@@ -1,5 +1,4 @@
-//! PC-to-phone side: listing the shared folder, serving downloads, and
-//! adding files passed on the command line.
+//! PC-to-phone side: listing what's shared and serving downloads.
 //!
 //! A name only resolves if it shows up in a directory listing. That one
 //! rule blocks traversal (`../x`, `a/b`), absolute paths, Windows device
@@ -7,7 +6,12 @@
 //! none of those can appear as an entry name. The resolved path is then
 //! canonicalized and checked against the canonical shared folder, so a
 //! symlink pointing outside is refused too.
+//!
+//! The one exception is a file the person at the PC shared from elsewhere
+//! (see [`crate::share`]). Those resolve by their listed name to the exact
+//! path that was registered, and nothing else.
 
+use std::collections::HashSet;
 use std::fs::{self, DirEntry, Metadata};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -21,11 +25,11 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Serialize;
-use thiserror::Error;
 use tower_http::services::ServeFile;
 
-use crate::sanitize::{is_partial, sanitize_filename};
+use crate::sanitize::is_partial;
 use crate::server::AppState;
+use crate::share::{Extra, View};
 use crate::{human, upload};
 
 /// Read size for downloads. tower-http's 64 KB default means more
@@ -42,6 +46,8 @@ pub struct FileEntry {
 
 #[derive(Serialize)]
 pub struct FileList {
+    /// The shared folder's name, so the phone can show what it's looking at.
+    pub folder: String,
     pub files: Vec<FileEntry>,
 }
 
@@ -70,26 +76,26 @@ pub struct Scan {
     pub busy: usize,
 }
 
-/// Files in `dir` (top level only), newest first.
-pub fn list(dir: &Path) -> io::Result<Vec<FileEntry>> {
-    scan(dir).map(|s| s.files)
+/// Files in the shared folder (top level only) and files shared from
+/// elsewhere, newest first.
+pub fn list(view: &View) -> io::Result<Vec<FileEntry>> {
+    scan(view).map(|s| s.files)
 }
 
-pub fn scan(dir: &Path) -> io::Result<Scan> {
+pub fn scan(view: &View) -> io::Result<Scan> {
+    let dir = &view.dir;
     let mut scan = Scan::default();
+    let mut taken = HashSet::new();
     for entry in fs::read_dir(dir)?.filter_map(Result::ok) {
-        let Some(v) = inspect(&entry, dir) else {
-            continue;
-        };
-        if is_being_written(&v) {
-            scan.busy += 1;
-            continue;
+        taken.insert(entry.file_name().to_string_lossy().into_owned());
+        if let Some(v) = inspect(&entry, dir) {
+            scan.add(v);
         }
-        scan.files.push(FileEntry {
-            modified: modified_secs(&v.meta),
-            size: v.meta.len(),
-            name: v.name,
-        });
+    }
+    for (name, extra) in extra_names(&mut taken, view) {
+        if let Some(v) = inspect_extra(extra, name) {
+            scan.add(v);
+        }
     }
     scan.files.sort_by(|a, b| {
         b.modified
@@ -97,6 +103,52 @@ pub fn scan(dir: &Path) -> io::Result<Scan> {
             .then_with(|| a.name.cmp(&b.name))
     });
     Ok(scan)
+}
+
+impl Scan {
+    fn add(&mut self, v: Visible) {
+        if is_being_written(&v) {
+            self.busy += 1;
+            return;
+        }
+        self.files.push(FileEntry {
+            modified: modified_secs(&v.meta),
+            size: v.meta.len(),
+            name: v.name,
+        });
+    }
+}
+
+/// The names files shared from elsewhere go by on the phone: their own,
+/// or numbered when an entry in the folder (`taken`) or an earlier extra
+/// already has it. Uploads keep their names; an extra moves aside. Files
+/// that are in the shared folder now are left out, since they're listed
+/// already.
+fn extra_names<'a>(taken: &mut HashSet<String>, view: &'a View) -> Vec<(String, &'a Extra)> {
+    let mut names = Vec::new();
+    for extra in &view.extras {
+        if extra.path.parent() == Some(view.dir.as_path()) {
+            continue;
+        }
+        let name = (0..)
+            .map(|n| upload::numbered_name(&extra.name, n))
+            .find(|n| !taken.contains(n))
+            .unwrap_or_default();
+        taken.insert(name.clone());
+        names.push((name, extra));
+    }
+    names
+}
+
+/// A file shared from elsewhere, if it's still a file at the same place.
+fn inspect_extra(extra: &Extra, name: String) -> Option<Visible> {
+    // Canonicalizing again catches the file being swapped for a link to
+    // somewhere else since it was shared.
+    let path = fs::canonicalize(&extra.path)
+        .ok()
+        .filter(|p| *p == extra.path)?;
+    let meta = fs::metadata(&path).ok().filter(Metadata::is_file)?;
+    Some(Visible { name, path, meta })
 }
 
 /// True while another program is still copying or saving the file.
@@ -148,19 +200,34 @@ fn locked_for_writing(_path: &Path) -> bool {
 }
 
 /// The canonical path of the listed file called exactly `name`, if any.
-pub fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
+pub fn resolve(view: &View, name: &str) -> Option<PathBuf> {
     // Cheap rejections before scanning the folder. The scan below is the
     // real guarantee; these only skip pointless work.
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
         return None;
     }
-    fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == name)
-        .and_then(|entry| inspect(&entry, dir))
-        .filter(|v| !is_being_written(v))
-        .map(|v| v.path)
+    let dir = &view.dir;
+    // An unreadable folder (a drive unplugged, say) still leaves the
+    // files shared from elsewhere.
+    let entries: Vec<DirEntry> = fs::read_dir(dir)
+        .map(|rd| rd.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    let found = match entries.iter().find(|entry| entry.file_name() == name) {
+        // The name belongs to the folder, even if that entry isn't shown
+        // (hidden, a subfolder): extras are numbered around every entry.
+        Some(entry) => inspect(entry, dir),
+        None => {
+            let mut taken = entries
+                .iter()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            extra_names(&mut taken, view)
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(n, extra)| inspect_extra(extra, n))
+        }
+    };
+    found.filter(|v| !is_being_written(v)).map(|v| v.path)
 }
 
 /// Decides whether a directory entry is a shareable file.
@@ -245,9 +312,16 @@ fn percent_encode(s: &str) -> String {
 
 /// `GET /api/files`
 pub async fn list_handler(State(state): State<AppState>) -> Response {
-    let dir = state.dir.clone();
-    match tokio::task::spawn_blocking(move || list(&dir)).await {
-        Ok(Ok(files)) => Json(FileList { files }).into_response(),
+    let view = state.share.view();
+    let shown = state.share.folder().display.clone();
+    // "E:\" has no last component; show it whole.
+    let folder = shown
+        .file_name()
+        .unwrap_or(shown.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    match tokio::task::spawn_blocking(move || list(&view)).await {
+        Ok(Ok(files)) => Json(FileList { folder, files }).into_response(),
         Ok(Err(e)) => {
             tracing::error!("Could not read the shared folder: {e}");
             (
@@ -271,9 +345,9 @@ pub async fn download_handler(
     UrlPath(name): UrlPath<String>,
     req: Request,
 ) -> Response {
-    let dir = state.dir.clone();
+    let view = state.share.view();
     let lookup = name.clone();
-    let path = tokio::task::spawn_blocking(move || resolve(&dir, &lookup))
+    let path = tokio::task::spawn_blocking(move || resolve(&view, &lookup))
         .await
         .ok()
         .flatten();
@@ -388,104 +462,6 @@ impl Drop for DownloadLog {
     }
 }
 
-// ---- Files passed on the command line (FR-21) ----
-
-#[derive(Debug, Error)]
-pub enum ShareError {
-    #[error("{0} was not found")]
-    NotFound(PathBuf),
-    #[error("{0} is a folder; only files can be shared")]
-    IsFolder(PathBuf),
-    #[error("could not add {path}: {source}")]
-    Io { path: PathBuf, source: io::Error },
-    #[error("could not add {path}: {source}")]
-    Store {
-        path: PathBuf,
-        source: upload::UploadError,
-    },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Shared {
-    /// Hard link: instant, uses no extra disk space.
-    Linked(String),
-    /// Copied, because the file is on another drive.
-    Copied(String),
-    /// The file is already in the shared folder.
-    AlreadyThere(String),
-}
-
-/// Puts `src` into the shared folder under a free name, without ever
-/// overwriting. Tries a hard link first and falls back to copying. Blocking.
-pub fn add_to_share(src: &Path, dir: &Path) -> Result<Shared, ShareError> {
-    let io_err = |source| ShareError::Io {
-        path: src.to_path_buf(),
-        source,
-    };
-    let meta = match fs::metadata(src) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(ShareError::NotFound(src.to_path_buf()));
-        }
-        Err(e) => return Err(io_err(e)),
-    };
-    if meta.is_dir() {
-        return Err(ShareError::IsFolder(src.to_path_buf()));
-    }
-    let canonical = fs::canonicalize(src).map_err(io_err)?;
-    let original_name = canonical
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if canonical.parent() == Some(dir) {
-        return Ok(Shared::AlreadyThere(original_name));
-    }
-    let name = sanitize_filename(&original_name);
-
-    // `hard_link` fails if the target exists, so it can't overwrite.
-    for n in 0..10_000 {
-        let target = dir.join(upload::numbered_name(&name, n));
-        match fs::hard_link(&canonical, &target) {
-            Ok(()) => return Ok(Shared::Linked(file_name_of(&target))),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            // Different drive, or a filesystem without hard links (FAT, exFAT).
-            Err(_) => break,
-        }
-    }
-
-    copy_into_share(&canonical, dir, &name).map(Shared::Copied)
-}
-
-/// Copies into a temp file, so a half-finished copy is never listed, then
-/// claims a free name the same way uploads do. Returns the name used.
-fn copy_into_share(src: &Path, dir: &Path, name: &str) -> Result<String, ShareError> {
-    let part = dir.join(upload::part_name(name, rand::random()));
-    let placed = fs::copy(src, &part)
-        .map_err(|source| ShareError::Io {
-            path: src.to_path_buf(),
-            source,
-        })
-        .and_then(|_| {
-            upload::move_into_place(&part, dir, name).map_err(|source| ShareError::Store {
-                path: src.to_path_buf(),
-                source,
-            })
-        });
-    match placed {
-        Ok(target) => Ok(file_name_of(&target)),
-        Err(e) => {
-            let _ = fs::remove_file(&part);
-            Err(e)
-        }
-    }
-}
-
-fn file_name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,8 +483,129 @@ mod tests {
             .unwrap();
     }
 
+    // Most tests share just a folder.
+    fn list(dir: &Path) -> io::Result<Vec<FileEntry>> {
+        super::list(&View::of(dir.to_path_buf()))
+    }
+
+    fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
+        super::resolve(&View::of(dir.to_path_buf()), name)
+    }
+
+    // Only the Windows-only tests look at files still being written.
+    #[cfg(windows)]
+    fn scan(dir: &Path) -> io::Result<Scan> {
+        super::scan(&View::of(dir.to_path_buf()))
+    }
+
     fn names(dir: &Path) -> Vec<String> {
         list(dir).unwrap().into_iter().map(|f| f.name).collect()
+    }
+
+    fn extra(id: u32, path: &Path) -> Extra {
+        let path = path.canonicalize().unwrap();
+        Extra {
+            id,
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            display: path.clone(),
+            path,
+        }
+    }
+
+    #[test]
+    fn files_from_elsewhere_are_listed_and_served_in_place() {
+        let shared = tempfile::tempdir().unwrap();
+        let ssd = tempfile::tempdir().unwrap();
+        let dir = canon(&shared);
+        write_aged(&dir, "notes.txt", b"in the folder", 100);
+        write_aged(ssd.path(), "movie.mkv", b"frames", 100);
+        let view = View {
+            dir: dir.clone(),
+            extras: vec![extra(0, &ssd.path().join("movie.mkv"))],
+        };
+
+        let mut listed: Vec<_> = super::list(&view)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.name, f.size))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, [("movie.mkv".into(), 6), ("notes.txt".into(), 13)]);
+        assert_eq!(
+            super::resolve(&view, "movie.mkv"),
+            Some(ssd.path().join("movie.mkv").canonicalize().unwrap())
+        );
+        // Without the extra, the name means nothing.
+        assert_eq!(resolve(&dir, "movie.mkv"), None);
+    }
+
+    #[test]
+    fn a_file_from_elsewhere_moves_aside_for_a_folder_file_of_the_same_name() {
+        let shared = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let dir = canon(&shared);
+        write_aged(&dir, "photo.jpg", b"folder", 100);
+        write_aged(a.path(), "photo.jpg", b"from a", 100);
+        write_aged(b.path(), "photo.jpg", b"from b", 100);
+        let view = View {
+            dir: dir.clone(),
+            extras: vec![
+                extra(0, &a.path().join("photo.jpg")),
+                extra(1, &b.path().join("photo.jpg")),
+            ],
+        };
+        let mut listed: Vec<_> = super::list(&view)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["photo (1).jpg", "photo (2).jpg", "photo.jpg"]);
+
+        let read = |name| fs::read(super::resolve(&view, name).unwrap()).unwrap();
+        assert_eq!(read("photo.jpg"), b"folder");
+        assert_eq!(read("photo (1).jpg"), b"from a");
+        assert_eq!(read("photo (2).jpg"), b"from b");
+    }
+
+    #[test]
+    fn files_from_elsewhere_that_moved_or_are_now_in_the_folder() {
+        let shared = tempfile::tempdir().unwrap();
+        let ssd = tempfile::tempdir().unwrap();
+        let dir = canon(&shared);
+        write_aged(ssd.path(), "gone.mkv", b"x", 100);
+        write_aged(&dir, "here.txt", b"y", 100);
+        let view = View {
+            dir: dir.clone(),
+            extras: vec![
+                extra(0, &ssd.path().join("gone.mkv")),
+                // Shared before the folder was switched to its own folder.
+                extra(1, &dir.join("here.txt")),
+            ],
+        };
+        fs::remove_file(ssd.path().join("gone.mkv")).unwrap();
+        // Listed once, as a folder file, and the deleted one not at all.
+        assert_eq!(
+            super::list(&view)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.name)
+                .collect::<Vec<_>>(),
+            ["here.txt"]
+        );
+        assert_eq!(super::resolve(&view, "gone.mkv"), None);
+    }
+
+    #[test]
+    fn files_from_elsewhere_survive_an_unreadable_folder_on_download() {
+        let ssd = tempfile::tempdir().unwrap();
+        write_aged(ssd.path(), "movie.mkv", b"frames", 100);
+        let view = View {
+            dir: ssd.path().join("unplugged"),
+            extras: vec![extra(0, &ssd.path().join("movie.mkv"))],
+        };
+        assert!(super::resolve(&view, "movie.mkv").is_some());
     }
 
     #[test]
@@ -718,78 +815,5 @@ mod tests {
         assert!(tricky.starts_with("attachment; filename=\"a_b_c_41;d.txt\";"));
         assert!(tricky.ends_with("filename*=UTF-8''a%22b%5Cc%2541%3Bd.txt"));
         assert!(HeaderValue::from_str(&content_disposition("日本 📷\u{7f}.txt")).is_ok());
-    }
-
-    #[test]
-    fn adds_a_file_without_overwriting() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let src = src_dir.path().join("movie.mp4");
-        fs::write(&src, b"movie").unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = canon(&tmp);
-        fs::write(dir.join("movie.mp4"), b"existing").unwrap();
-
-        let result = add_to_share(&src, &dir).unwrap();
-        let name = match &result {
-            Shared::Linked(n) | Shared::Copied(n) => n.clone(),
-            other => panic!("unexpected {other:?}"),
-        };
-        assert_eq!(name, "movie (1).mp4");
-        assert_eq!(fs::read(dir.join("movie.mp4")).unwrap(), b"existing");
-        assert_eq!(fs::read(dir.join(&name)).unwrap(), b"movie");
-        assert_eq!(names(&dir).len(), 2, "no temp file may remain");
-    }
-
-    /// The other-drive path, which a same-drive test can't reach through
-    /// `add_to_share` because the hard link always works there.
-    #[test]
-    fn copy_fallback_never_overwrites_and_leaves_no_temp_file() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let src = src_dir.path().join("doc.pdf");
-        fs::write(&src, b"new copy").unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = canon(&tmp);
-        fs::write(dir.join("doc.pdf"), b"existing").unwrap();
-
-        assert_eq!(
-            copy_into_share(&src, &dir, "doc.pdf").unwrap(),
-            "doc (1).pdf"
-        );
-        assert_eq!(fs::read(dir.join("doc.pdf")).unwrap(), b"existing");
-        assert_eq!(fs::read(dir.join("doc (1).pdf")).unwrap(), b"new copy");
-        let all: Vec<_> = fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(all.len(), 2, "no temp file may remain");
-
-        // A failed copy cleans up after itself too.
-        assert!(copy_into_share(&src_dir.path().join("gone.pdf"), &dir, "gone.pdf").is_err());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
-    }
-
-    #[test]
-    fn rejects_missing_files_and_folders() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = canon(&tmp);
-        let missing = tmp.path().join("nope.txt");
-        assert!(matches!(
-            add_to_share(&missing, &dir),
-            Err(ShareError::NotFound(_))
-        ));
-        let folder = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            add_to_share(folder.path(), &dir),
-            Err(ShareError::IsFolder(_))
-        ));
-    }
-
-    #[test]
-    fn a_file_already_in_the_folder_is_left_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = canon(&tmp);
-        fs::write(dir.join("here.txt"), b"x").unwrap();
-        assert_eq!(
-            add_to_share(&dir.join("here.txt"), &dir).unwrap(),
-            Shared::AlreadyThere("here.txt".into())
-        );
-        assert_eq!(names(&dir), ["here.txt"]);
     }
 }

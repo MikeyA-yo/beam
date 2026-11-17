@@ -5,6 +5,9 @@
 //! translating them, we wait for things to calm down, rescan the folder,
 //! and diff the result against the last scan. That makes the events
 //! correct no matter which raw events arrived.
+//!
+//! When the PC switches to another folder, the watcher moves to it and
+//! tells every page to refetch the list.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,9 +16,10 @@ use std::time::Duration;
 
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
+use crate::config::SharedDir;
 use crate::events::Event;
 use crate::files::{self, FileEntry};
 use crate::sanitize::is_partial;
@@ -39,55 +43,68 @@ type Snapshot = HashMap<String, FileEntry>;
 /// anything that changes afterwards is reported. The task stops on shutdown.
 pub async fn start(state: AppState) -> JoinHandle<()> {
     let signal = Arc::new(Notify::new());
-    let watcher = watch(&state.dir, signal.clone());
-    if watcher.is_none() {
-        tracing::warn!(
-            "Can't watch the shared folder for changes; checking it every {} seconds instead.",
-            POLL.as_secs()
-        );
-    }
+    let mut folder = state.share.subscribe();
+    let dir = folder.borrow_and_update().canonical.clone();
+    let watcher = watch_or_poll(&dir, signal.clone());
     let known = snapshot(&state).await.unwrap_or_default();
-    tokio::spawn(run(state, signal, watcher, known))
+    tokio::spawn(run(state, signal, folder, watcher, known))
 }
 
 async fn run(
     state: AppState,
     signal: Arc<Notify>,
-    watcher: Option<RecommendedWatcher>,
+    mut folder: watch::Receiver<Arc<SharedDir>>,
+    mut watcher: Option<RecommendedWatcher>,
     mut known: Snapshot,
 ) {
-    let idle = if watcher.is_some() {
-        SAFETY_RESCAN
-    } else {
-        POLL
-    };
     let mut shutdown = state.shutdown_signal();
     let mut busy = false;
     loop {
+        let idle = if watcher.is_some() {
+            SAFETY_RESCAN
+        } else {
+            POLL
+        };
         let wait = if busy { BUSY_RECHECK } else { idle };
+        let mut switched = false;
         tokio::select! {
             () = signal.notified() => settle(&signal).await,
             () = tokio::time::sleep(wait) => {}
+            changed = folder.changed() => {
+                // The sender lives as long as the server state.
+                if changed.is_err() {
+                    break;
+                }
+                let dir = folder.borrow_and_update().canonical.clone();
+                // Stop watching the old folder before watching the new one.
+                drop(watcher.take());
+                watcher = watch_or_poll(&dir, signal.clone());
+                switched = true;
+            }
             _ = shutdown.changed() => break,
         }
-        let dir = state.dir.clone();
-        let scan = match tokio::task::spawn_blocking(move || files::scan(&dir)).await {
-            Ok(Ok(scan)) => scan,
+        let view = state.share.view();
+        let scan = match tokio::task::spawn_blocking(move || files::scan(&view)).await {
+            Ok(Ok(scan)) => Some(scan),
             Ok(Err(e)) => {
                 tracing::debug!("rescan failed: {e}");
-                continue;
+                None
             }
             Err(e) => {
                 tracing::debug!("rescan task failed: {e}");
-                continue;
+                None
             }
         };
+        if switched {
+            // A list of removals and additions would replay the whole
+            // switch file by file; a refetch is one request.
+            known = scan.map(|s| into_snapshot(s.files)).unwrap_or_default();
+            let _ = state.events.send(Event::Resync);
+            continue;
+        }
+        let Some(scan) = scan else { continue };
         busy = scan.busy > 0;
-        let now: Snapshot = scan
-            .files
-            .into_iter()
-            .map(|f| (f.name.clone(), f))
-            .collect();
+        let now = into_snapshot(scan.files);
         for event in diff(&known, &now) {
             // No receivers just means no page is open.
             let _ = state.events.send(event);
@@ -97,13 +114,29 @@ async fn run(
     drop(watcher);
 }
 
+fn into_snapshot(files: Vec<FileEntry>) -> Snapshot {
+    files.into_iter().map(|f| (f.name.clone(), f)).collect()
+}
+
 async fn snapshot(state: &AppState) -> Option<Snapshot> {
-    let dir = state.dir.clone();
-    let files = tokio::task::spawn_blocking(move || files::list(&dir))
+    let view = state.share.view();
+    let files = tokio::task::spawn_blocking(move || files::list(&view))
         .await
         .ok()?
         .ok()?;
-    Some(files.into_iter().map(|f| (f.name.clone(), f)).collect())
+    Some(into_snapshot(files))
+}
+
+/// Watches `dir`, or says it will poll instead (some network drives).
+fn watch_or_poll(dir: &Path, signal: Arc<Notify>) -> Option<RecommendedWatcher> {
+    let watcher = watch(dir, signal);
+    if watcher.is_none() {
+        tracing::warn!(
+            "Can't watch the shared folder for changes; checking it every {} seconds instead.",
+            POLL.as_secs()
+        );
+    }
+    watcher
 }
 
 /// Returns once events stop for [`QUIET`], or [`MAX_DELAY`] after the first.

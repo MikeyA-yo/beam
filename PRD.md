@@ -6,7 +6,7 @@ Browser-based local file sharing between a PC and a phone. The PC runs a single 
 |---|---|
 | Owner | Ay |
 | Status | Draft |
-| Version | v1 (files), v1.1 (clipboard on request) |
+| Version | v1 (files), v1.1 (clipboard on request), v1.2 (share from anywhere on the PC) |
 | Primary setup | HP laptop on Windows + Android phone (Chrome) |
 
 ## 1. Problem
@@ -58,7 +58,7 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 - **FR-3:** Generate a random session token (at least 128 bits, URL-safe) on every start.
 - **FR-4:** Print the full URL and render it as a QR code in the terminal.
 - **FR-4a:** Also open the PC's default browser at a local page (`/qr`) that shows the QR code large, one per LAN address with a switcher. The page is a web UI served by Beam, not a desktop app, and sits behind the same cookie auth (the browser link exchanges the token first). The terminal output stays as in FR-4. `--no-open` disables opening the browser.
-- **FR-5:** Use a shared folder, by default `~/Downloads/Beam` (create it if missing), overridable with `--dir`.
+- **FR-5:** Use a shared folder, by default `~/Downloads/Beam` (create it if missing), overridable with `--dir`, and switchable while Beam runs (FR-33).
 
 ### 6.2 Auth
 
@@ -79,11 +79,11 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 
 ### 6.4 PC to phone (download)
 
-- **FR-17:** List files in the shared folder (top level only for v1) with name, size, and modified time, newest first.
+- **FR-17:** List files in the shared folder (top level only for v1), plus files shared from elsewhere (FR-32), with name, size, and modified time, newest first.
 - **FR-18:** Downloads support HTTP range requests so the browser can resume or seek.
 - **FR-19:** Serve downloads with `Content-Disposition: attachment` and the original filename.
 - **FR-20:** Requests for paths outside the shared folder (traversal, absolute paths, symlinks pointing out) return 404.
-- **FR-21:** Optionally accept files at startup, `beam file1.mp4 file2.pdf`, which are copied or linked into the shared folder.
+- **FR-21:** Optionally accept files at startup, `beam file1.mp4 file2.pdf`. They are served from where they are, never copied (FR-32).
 
 ### 6.5 Live updates
 
@@ -103,6 +103,15 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 - **FR-29:** When there is both, text wins (copying Excel cells puts both on the clipboard). An image file copied in Explorer (Ctrl+C or right-click, Copy) puts only its path on the clipboard, not the picture, so on Windows Beam reads that file and sends it as it is, if it's a single PNG, JPEG, GIF, WebP or BMP of at most 128 MB, recognised by its content rather than its name. Several copied files, or a file that isn't such an image, get a clear message instead; those belong in the shared folder. If there's nothing usable at all, the page says there's nothing to get.
 - **FR-30:** Same cookie auth as everything else. The server checks images strictly before they reach the clipboard, and caps a clipboard request at 128 MB. Clipboard data is held in memory (it lives in memory on both ends anyway), unlike file uploads.
 - **FR-31:** The terminal logs each clipboard transfer with direction, IP, and type and size ("text, 42 characters" or "image, 1080×2400"), never the contents.
+
+### 6.8 Sharing from anywhere on the PC (v1.2)
+
+The PC's own drive may be short on space, for example when sending a film from an external SSD. Nothing should need to be copied onto it.
+
+- **FR-32:** Files given at startup are served in place: no copy, no hard link, nothing written to the PC. They stay shared until Beam stops or the PC stops sharing them. If a file in the shared folder has the same name, the outside file is listed as `name (1).ext`; folder files keep their names. Each download checks the file is still at the registered path and is still a file.
+- **FR-33:** The PC's QR page has a **Shared folder** box. Pasting a folder path (quotes from Explorer's "Copy as path" are stripped) switches the shared folder without restarting: the watcher moves to it, phones refetch the list at once, and uploads go there. The token and cookies keep working. Transfers already running finish in the old folder. A folder that doesn't exist is refused, never created, and relative paths are refused.
+- **FR-34:** The page lists earlier folders of this run to switch back with one click, and the files shared from elsewhere with a **Stop sharing** button.
+- **FR-35:** Only the PC itself can see or change what's shared: those routes answer requests from the loopback address only, so a phone with a valid cookie gets 403. They take JSON only, so another website can't send them without a CORS preflight. The phone page shows the shared folder's name, never its full path.
 
 ## 7. Non-functional requirements
 
@@ -124,6 +133,9 @@ The primary user is Ay: one PC, one phone, same Wi-Fi or the phone's hotspot.
 | POST | `/api/upload` | Multipart upload, streamed to disk |
 | GET | `/api/files/{name}` | Download one file, with range support |
 | GET | `/ws` | WebSocket for live events |
+| GET | `/api/share` | The shared folder, earlier folders and files shared from elsewhere; PC only (FR-35) |
+| PUT | `/api/share/folder` | Switch the shared folder, JSON `{"path": ...}`; PC only (FR-33) |
+| DELETE | `/api/share/files/{id}` | Stop sharing a file from elsewhere; PC only (FR-34) |
 | GET | `/api/clipboard` | The PC's clipboard: text or an image (PNG, JPEG, GIF, WebP or BMP) by `Content-Type`; 204 if empty, 409 with a message if a copied file can't be sent (FR-27, FR-29) |
 | PUT | `/api/clipboard` | Set the PC's clipboard from `text/plain` or `image/bmp` (FR-26, FR-28) |
 
@@ -145,7 +157,7 @@ Example event over the WebSocket:
 
 ## 10. Security
 
-The threat model is other people on the same Wi-Fi. The token in the QR code is the only thing that grants access, it rotates on every run, and it never appears in server logs. Transport is plain HTTP in v1, so traffic on the local network is not encrypted; this is an accepted v1 tradeoff and HTTPS is planned for v2. Filename sanitization and path containment are mandatory because the server writes attacker-influenced names to disk. The clipboard can hold secrets, so it is only read when the phone asks and its contents are never logged.
+The threat model is other people on the same Wi-Fi. The token in the QR code is the only thing that grants access, it rotates on every run, and it never appears in server logs. Transport is plain HTTP in v1, so traffic on the local network is not encrypted; this is an accepted v1 tradeoff and HTTPS is planned for v2. Filename sanitization and path containment are mandatory because the server writes attacker-influenced names to disk. The clipboard can hold secrets, so it is only read when the phone asks and its contents are never logged. Changing what is shared would let anyone holding the QR code reach any folder on the PC, so it is restricted to the PC itself (FR-35), not merely to holders of the cookie.
 
 ## 11. Acceptance criteria
 
@@ -168,6 +180,7 @@ v1 is done when all of these pass on the real setup (Windows laptop + Android ph
 4. **M4:** WebSocket events and folder watching.
 5. **M5:** UI polish (progress, speed, errors), logging, and the acceptance pass above.
 6. **M6 (v1.1):** clipboard text both ways, and images both ways on Windows (section 6.7).
+7. **M7 (v1.2):** files served in place, and switching the shared folder from the PC while running (section 6.8).
 
 ## 13. Future (v2 and beyond)
 

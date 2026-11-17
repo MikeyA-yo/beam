@@ -5,7 +5,8 @@ use anyhow::Context;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use beam::{browser, config, files, net, server, upload};
+use beam::share::{Added, Share};
+use beam::{browser, config, net, server, upload};
 
 /// Send files between this PC and your phone over the local network.
 #[derive(Parser)]
@@ -24,8 +25,8 @@ struct Cli {
     #[arg(long)]
     no_open: bool,
 
-    /// Files to offer to the phone. They are added to the shared folder:
-    /// hard-linked when possible (instant, no extra space), otherwise copied.
+    /// Files to offer to the phone, from anywhere on this PC (another
+    /// drive, say). They're served from where they are, never copied.
     files: Vec<PathBuf>,
 }
 
@@ -82,13 +83,9 @@ async fn main() -> anyhow::Result<()> {
         println!();
     }
 
-    if !cli.files.is_empty() {
-        let dir = shared.canonical.clone();
-        // Copies from another drive can take a while; don't hold up the server.
-        tokio::task::spawn_blocking(move || share_files(&cli.files, &dir));
-    }
-
-    let state = server::AppState::new(token, shared.canonical).with_phone_urls(phone_urls);
+    let state = server::AppState::new(token, shared).with_phone_urls(phone_urls);
+    // Nothing is copied, so this is quick enough to do before serving.
+    share_files(&state.share, &cli.files);
     server::serve(listener, state, shutdown_signal())
         .await
         .context("server stopped unexpectedly")?;
@@ -127,7 +124,8 @@ fn print_banner(
             println!();
             println!("  {best}");
             println!();
-            println!("Bigger QR code in your browser:");
+            println!("Bigger QR code in your browser, where you can also share another");
+            println!("folder without restarting:");
             println!("  {qr_page}");
             if !others.is_empty() {
                 println!();
@@ -154,16 +152,16 @@ fn print_banner(
     println!();
 }
 
-fn share_files(paths: &[PathBuf], dir: &std::path::Path) {
+fn share_files(share: &Share, paths: &[PathBuf]) {
     for path in paths {
-        match files::add_to_share(path, dir) {
-            Ok(files::Shared::Linked(name)) => tracing::info!("Sharing {name:?}"),
-            Ok(files::Shared::Copied(name)) => {
-                tracing::info!("Sharing {name:?} (copied, because it is on another drive)");
+        match share.add_file(path) {
+            Ok(Added::Shared(extra)) => {
+                tracing::info!("Sharing {:?} from {}", extra.name, extra.display.display());
             }
-            Ok(files::Shared::AlreadyThere(name)) => {
+            Ok(Added::InFolder(name)) => {
                 tracing::info!("Sharing {name:?} (already in the shared folder)");
             }
+            Ok(Added::AlreadyShared(_)) => {}
             Err(e) => tracing::warn!("Not shared: {e}"),
         }
     }

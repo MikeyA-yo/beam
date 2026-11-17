@@ -6,11 +6,11 @@ Instructions for any AI coding agent working in this repo. Read `PRD.md` first; 
 
 ## Project in one paragraph
 
-Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files; v1.1 adds clipboard sharing on request (text on every platform, images on Windows). No HTTPS, no mobile app.
+Beam (working name) is a single Rust binary that runs on a PC and lets a phone send and receive files through its browser over the local network. The PC prints a QR code containing a URL with a session token; the phone scans it, opens a small embedded web page, and uploads or downloads files. v1 is files; v1.1 adds clipboard sharing on request (text on every platform, images on Windows). v1.2 serves files from anywhere on the PC without copying, and lets the PC switch the shared folder while running. No HTTPS, no mobile app.
 
 ## Working style
 
-- Work milestone by milestone (M1 to M6 in the PRD). Finish and verify one before starting the next.
+- Work milestone by milestone (M1 to M7 in the PRD). Finish and verify one before starting the next.
 - Before writing code for a milestone, state briefly what you plan to change and which files you will touch.
 - Keep changes small and reviewable. Do not refactor unrelated code.
 - Do not add features outside v1 scope, even if they seem easy. If something seems missing from the PRD, ask instead of inventing it.
@@ -51,6 +51,7 @@ src/
   events.rs      WebSocket handler and broadcast channel
   watcher.rs     folder watching, emits events
   sanitize.rs    filename sanitization and path containment
+  share.rs       the shared folder (switchable from the PC only), files shared in place
   clipboard.rs   clipboard thread, backends, /api/clipboard handlers
   clipboard/     image.rs (image format helpers), dropfiles.rs (files copied in Explorer),
                  win.rs (Windows clipboard images)
@@ -69,7 +70,7 @@ These come from the PRD and are not optional.
 3. **Write uploads to `name.part`, then rename** on success. Delete the `.part` file on any error or client disconnect.
 4. **Never overwrite.** On name collision, use `name (1).ext`, `name (2).ext`, and so on.
 5. **Sanitize every filename** that comes from the client, in `sanitize.rs`, with unit tests. Strip directory components, reject `..`, remove `<>:"/\|?*` and control characters, handle Windows reserved names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, with or without an extension), trim trailing dots and spaces, cap the length, and fall back to a generated name if nothing is left.
-6. **Path containment on downloads.** Canonicalize the requested path and confirm it is inside the canonicalized shared folder, including after resolving symlinks. Anything else returns 404.
+6. **Path containment on downloads.** Canonicalize the requested path and confirm it is inside the canonicalized shared folder, including after resolving symlinks. The only exception is a file the person at the PC shared from elsewhere (PRD FR-32), which resolves to exactly its registered path. Anything else returns 404.
 7. **Auth on every route** except the initial `/?t=<token>` exchange. Use an `HttpOnly`, `SameSite=Strict` cookie. Compare tokens in constant time. Never log the token.
 8. **No external resources in the web page.** No CDNs, Google Fonts, or remote scripts. The phone may have no internet. Plain HTML, CSS, and vanilla JS are preferred; no frontend build step.
 9. **No outbound network calls and no telemetry** from the binary.

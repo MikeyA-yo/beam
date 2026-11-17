@@ -132,14 +132,21 @@ pub async fn handle(
             continue;
         };
         let started = Instant::now();
-        match save_field(field, &state.dir, &sent_name).await {
+        // Captured once: if the PC switches folders mid-upload, the file
+        // still finishes where it started.
+        let dir = state.share.dir();
+        match save_field(field, &dir, &sent_name).await {
             Ok(saved) => {
                 log_received(&saved, &sent_name, peer, started.elapsed());
-                let _ = state.events.send(Event::UploadCompleted {
-                    name: saved.name.clone(),
-                    size: saved.size,
-                    modified: unix_now(),
-                });
+                // Pages list the current folder, so a file that landed in
+                // the old one isn't theirs to show.
+                if state.share.dir() == dir {
+                    let _ = state.events.send(Event::UploadCompleted {
+                        name: saved.name.clone(),
+                        size: saved.size,
+                        modified: unix_now(),
+                    });
+                }
                 files.push(saved);
             }
             Err(e) => {

@@ -45,6 +45,8 @@
   main { max-width: 640px; margin: 0 auto; padding: 16px; }
   h1 { font-size: 1.4rem; margin: 8px 0 16px; }
   h2 { font-size: 1.1rem; margin: 0; }
+  h2 .folder { font-weight: 400; color: var(--muted); }
+  h2 .folder:not(:empty)::before { content: "· "; }
   section {
     background: var(--card);
     border: 1px solid var(--border);
@@ -267,7 +269,7 @@
 
   <section id="receive">
     <div class="head">
-      <h2>On PC</h2>
+      <h2>On PC <span class="folder" id="files-folder"></span></h2>
       <div class="tools">
         <span class="live" id="live" data-state="connecting" aria-live="polite">Connecting…</span>
         <button class="small" id="refresh" type="button">Refresh</button>
@@ -469,7 +471,9 @@
   const fileList = document.getElementById("files");
   const filesEmpty = document.getElementById("files-empty");
   const refreshBtn = document.getElementById("refresh");
+  const filesFolder = document.getElementById("files-folder");
   let loading = null;
+  let reloadAfter = false;
   let refreshTimer = 0;
 
   refreshBtn.addEventListener("click", () => loadFiles());
@@ -487,7 +491,9 @@
 
   function loadFiles() {
     if (expired) return Promise.resolve();
-    if (loading) return loading; // one request at a time
+    // One request at a time. If the list changed wholesale while one is in
+    // flight (the PC switched folders), its answer may be stale: go again.
+    if (loading) { reloadAfter = true; return loading; }
     refreshBtn.disabled = true;
     eventsDuringLoad = [];
     loading = fetch("/api/files", { cache: "no-store" })
@@ -498,6 +504,8 @@
       })
       .then((body) => {
         if (!body) return;
+        filesFolder.textContent = body.folder || "";
+        filesFolder.title = body.folder ? `Shared folder on the PC: ${body.folder}` : "";
         filesByName.clear();
         for (const f of body.files || []) filesByName.set(f.name, f);
         for (const ev of eventsDuringLoad) applyEvent(ev);
@@ -507,7 +515,12 @@
         filesEmpty.hidden = false;
         filesEmpty.textContent = "Couldn't load the list. Check the Wi-Fi, then tap Refresh.";
       })
-      .finally(() => { loading = null; eventsDuringLoad = []; refreshBtn.disabled = expired; });
+      .finally(() => {
+        loading = null;
+        eventsDuringLoad = [];
+        refreshBtn.disabled = expired;
+        if (reloadAfter) { reloadAfter = false; loadFiles(); }
+      });
     return loading;
   }
 

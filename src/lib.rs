@@ -18,6 +18,7 @@ pub mod net;
 mod qr;
 pub mod sanitize;
 pub mod server;
+pub mod share;
 mod socket;
 pub mod upload;
 pub mod watcher;

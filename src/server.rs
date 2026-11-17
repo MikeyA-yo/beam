@@ -1,7 +1,6 @@
 use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +9,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use rust_embed::Embed;
 use serde::Deserialize;
 use thiserror::Error;
@@ -18,7 +17,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
 use crate::clipboard::{self, Clipboard};
+use crate::config::SharedDir;
 use crate::events::{self, Event};
+use crate::share::{self, Share};
 use crate::{auth, files, human, qr, socket, upload, watcher};
 
 /// How many ports to try, starting from the requested one.
@@ -35,8 +36,8 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<str>,
-    /// Canonical shared folder.
-    pub dir: Arc<PathBuf>,
+    /// The shared folder and files shared from elsewhere.
+    pub share: Arc<Share>,
     /// Live updates for every connected page.
     pub events: broadcast::Sender<Event>,
     /// The URLs a phone can open (with the token), best first. Shown as QR
@@ -51,10 +52,10 @@ pub struct AppState {
 impl AppState {
     /// Uses the PC's real clipboard, which is only touched when the phone
     /// asks. Tests swap in [`clipboard::Memory`] with [`Self::with_clipboard`].
-    pub fn new(token: String, dir: PathBuf) -> Self {
+    pub fn new(token: String, folder: SharedDir) -> Self {
         Self {
             token: token.into(),
-            dir: Arc::new(dir),
+            share: Arc::new(Share::new(folder)),
             events: events::channel(),
             phone_urls: Arc::new(Vec::new()),
             clipboard: Clipboard::system(),
@@ -137,6 +138,10 @@ pub fn router(state: AppState) -> Router {
                 .put(clipboard::put_handler)
                 .layer(DefaultBodyLimit::max(clipboard::MAX_BODY_BYTES)),
         )
+        // Changing what's shared: from the PC itself only (see share.rs).
+        .route("/api/share", get(share::get_handler))
+        .route("/api/share/folder", put(share::folder_handler))
+        .route("/api/share/files/{id}", delete(share::remove_handler))
         .route("/ws", get(events::ws_handler))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(

@@ -77,6 +77,50 @@
   .alts button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
   .hint { margin: 20px 0 0; color: var(--muted); font-size: 0.85rem; }
   .none { color: var(--muted); }
+
+  /* What's shared. Left-aligned: paths read better that way. */
+  #share { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); text-align: left; }
+  #share h2 { font-size: 1.05rem; margin: 0 0 4px; }
+  .path {
+    margin: 0 0 12px;
+    font: 0.9rem/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+  #share form { display: flex; gap: 8px; }
+  #share input {
+    flex: 1;
+    min-width: 0;
+    min-height: 40px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--text);
+    font: 0.9rem ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  #share input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #share button {
+    min-height: 40px;
+    padding: 6px 16px;
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #share button.plain { background: transparent; color: var(--text); border-color: var(--border); font-weight: 400; }
+  #share button:disabled { opacity: 0.6; cursor: default; }
+  #share-status { min-height: 1.4em; margin: 8px 0 0; font-size: 0.85rem; color: var(--muted); }
+  #share-status[data-tone="bad"] { color: #e5484d; }
+  #share-status[data-tone="ok"] { color: #30a46c; }
+  #share h3 { font-size: 0.9rem; font-weight: 600; color: var(--muted); margin: 16px 0 6px; }
+  #share ul { list-style: none; margin: 0; padding: 0; }
+  #share li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); }
+  #share li:first-child { border-top: 0; }
+  #share li .path { flex: 1; margin: 0; }
+  #share li button { min-height: 32px; padding: 4px 12px; font-size: 0.85rem; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -88,8 +132,28 @@
   <p class="hint">
     Phone and PC must be on the same Wi-Fi. If the page won't open, allow Beam through
     Windows Firewall on private networks, set the Wi-Fi profile to Private, or connect this
-    PC to the phone's hotspot. This code works until Beam stops; you can close this tab.
+    PC to the phone's hotspot. This code works until Beam stops.
   </p>
+
+  <!-- Only shown on this PC: the server refuses these requests from the phone. -->
+  <section id="share" hidden>
+    <h2>Shared folder</h2>
+    <p class="path" id="share-folder"></p>
+    <form id="share-form">
+      <input id="share-path" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Paste a folder path, like D:\Movies" aria-label="Folder to share">
+      <button id="share-go" type="submit">Share</button>
+    </form>
+    <p id="share-status" aria-live="polite">Tip: in File Explorer, right-click a folder and choose "Copy as path".</p>
+    <div id="share-recent" hidden>
+      <h3>Shared earlier</h3>
+      <ul></ul>
+    </div>
+    <div id="share-files" hidden>
+      <h3>Also shared, from where they are</h3>
+      <ul></ul>
+    </div>
+  </section>
 </main>
 <script>
   // Switch which address the code points to.
@@ -99,6 +163,103 @@
       for (const b of document.querySelectorAll("[data-pick]")) b.setAttribute("aria-pressed", String(b === button));
     });
   }
+
+  // ---- What's shared ----
+
+  const share = document.getElementById("share");
+  const form = document.getElementById("share-form");
+  const input = document.getElementById("share-path");
+  const go = document.getElementById("share-go");
+  const shareStatus = document.getElementById("share-status");
+  let busy = false;
+
+  function say(text, tone) {
+    shareStatus.textContent = text;
+    shareStatus.dataset.tone = tone || "";
+  }
+
+  // Paths go in with textContent, never as HTML.
+  function render(info) {
+    document.getElementById("share-folder").textContent = info.folder;
+    const recent = document.querySelector("#share-recent ul");
+    recent.replaceChildren(...info.recent.map((path) => {
+      const li = document.createElement("li");
+      const p = document.createElement("span");
+      p.className = "path";
+      p.textContent = path;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "plain";
+      b.textContent = "Share again";
+      b.addEventListener("click", () => setFolder(path));
+      li.append(p, b);
+      return li;
+    }));
+    document.getElementById("share-recent").hidden = info.recent.length === 0;
+
+    const files = document.querySelector("#share-files ul");
+    files.replaceChildren(...info.files.map((f) => {
+      const li = document.createElement("li");
+      const p = document.createElement("span");
+      p.className = "path";
+      p.textContent = f.path;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "plain";
+      b.textContent = "Stop sharing";
+      b.addEventListener("click", () => send("DELETE", "/api/share/files/" + f.id, null, `Stopped sharing ${f.name}.`));
+      li.append(p, b);
+      return li;
+    }));
+    document.getElementById("share-files").hidden = info.files.length === 0;
+  }
+
+  async function send(method, url, body, done) {
+    if (busy) return;
+    busy = true;
+    go.disabled = true;
+    say("Working…", "");
+    try {
+      const res = await fetch(url, {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      const json = await res.json().catch(() => null);
+      if (res.ok && json) {
+        render(json);
+        say(typeof done === "function" ? done(json) : done, "ok");
+        return true;
+      }
+      const msg = json && json.error ? json.error : `error ${res.status}`;
+      say(msg.charAt(0).toUpperCase() + msg.slice(1) + ".", "bad");
+    } catch {
+      say("Beam isn't responding. Is it still running?", "bad");
+    } finally {
+      busy = false;
+      go.disabled = false;
+    }
+    return false;
+  }
+
+  function setFolder(path) {
+    return send("PUT", "/api/share/folder", { path }, (info) => `Now sharing ${info.folder}. The phone's list has updated.`);
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (await setFolder(input.value)) input.value = "";
+  });
+
+  // A phone that opens this page gets 403 and never sees the section.
+  fetch("/api/share", { cache: "no-store" })
+    .then((res) => (res.ok ? res.json() : null))
+    .then((info) => {
+      if (!info) return;
+      render(info);
+      share.hidden = false;
+    })
+    .catch(() => {});
 </script>
 </body>
 </html>

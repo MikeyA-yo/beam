@@ -48,6 +48,9 @@ pub enum Event {
         size: u64,
         modified: u64,
     },
+    /// The list changed wholesale (another folder is shared, say). Pages
+    /// refetch `/api/files`. Same message a lagging page gets.
+    Resync,
 }
 
 pub fn channel() -> broadcast::Sender<Event> {
@@ -145,6 +148,7 @@ mod tests {
         );
         let json = serde_json::to_string(&Event::FileRemoved { name: "a".into() }).unwrap();
         assert_eq!(json, r#"{"type":"file_removed","name":"a"}"#);
+        assert_eq!(serde_json::to_string(&Event::Resync).unwrap(), RESYNC);
     }
 
     #[tokio::test]
