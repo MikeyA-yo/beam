@@ -233,18 +233,20 @@ mod platform {
         Ok(m.TetheringOperationalState()? == TetheringOperationalState::On)
     }
 
+    /// Whatever stops Windows from answering (no connection, no Wi-Fi at
+    /// all, as on a desktop with only a cable) also means there's no
+    /// hotspot. Turning it on is where the reason gets reported.
     pub fn status() -> Result<Option<Network>, HotspotError> {
-        let m = match manager() {
-            Ok(m) => m,
-            // No connection means no hotspot either; that's not an error
-            // for someone only asking whether it's on.
-            Err(HotspotError::NoConnection | HotspotError::NotAllowed(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if !is_on(&m)? {
-            return Ok(None);
-        }
-        network_of(&m.GetCurrentAccessPointConfiguration()?).map(Some)
+        let current = manager().and_then(|m| {
+            if !is_on(&m)? {
+                return Ok(None);
+            }
+            network_of(&m.GetCurrentAccessPointConfiguration()?).map(Some)
+        });
+        Ok(current.unwrap_or_else(|e| {
+            tracing::debug!("hotspot status: {e}");
+            None
+        }))
     }
 
     pub fn start(changes: &mut Changes) -> Result<Network, HotspotError> {
