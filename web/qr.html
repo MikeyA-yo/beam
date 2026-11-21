@@ -161,7 +161,7 @@
   <h1>Scan with your phone</h1>
   <div class="modes" id="modes" role="tablist" hidden>
     <button type="button" role="tab" id="tab-wifi" aria-selected="true">Same Wi-Fi</button>
-    <button type="button" role="tab" id="tab-direct" aria-selected="false">Direct to this PC <span class="fast">faster</span></button>
+    <button type="button" role="tab" id="tab-direct" aria-selected="false">Direct to this PC <span class="fast">experimental</span></button>
   </div>
 
   <div id="mode-wifi">
@@ -179,6 +179,11 @@
       <p class="lead">
         This PC makes its own Wi-Fi network and the phone joins it. Files then go
         straight between them instead of through a router, which is usually much faster.
+      </p>
+      <p class="hint">
+        Experimental: not yet tried on many PCs and phones. It can't work if this PC gets
+        its internet from the same phone's hotspot, because the phone has to leave its own
+        hotspot to join this one.
       </p>
       <button type="button" class="big" id="hotspot-on">Turn on this PC's hotspot</button>
     </div>

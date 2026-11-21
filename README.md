@@ -9,7 +9,7 @@ Send files between your PC and your phone over Wi-Fi. Run Beam on the PC, scan t
 - **Phone to PC:** pick files on the phone; they land in a folder on the PC, with a progress bar for each.
 - **PC to phone:** files in that folder show up on the phone, ready to download. The list updates live as files are added.
 - **Share from anywhere, without copying.** Switch the shared folder while Beam runs, or share single files from another drive. Nothing is copied onto the PC, which matters when its disk is full.
-- **Direct connection, no router needed (Windows).** Beam can turn the PC into a Wi-Fi hotspot that the phone joins by scanning a code, so files go straight between them. Usually much faster than through a router.
+- **Direct connection, no router needed (Windows, experimental).** Beam can turn the PC into a Wi-Fi hotspot that the phone joins by scanning a code, so files go straight between them. Usually much faster than through a router.
 - **Big files are fine.** Files are streamed to and from disk, never held in memory, so a multi-gigabyte video transfers like a small one. Downloads can resume.
 - **Clipboard on request:** send text or an image to the PC's clipboard, or tap **Get from PC** to fetch what's on it: text, a screenshot, or an image file copied in Explorer. Beam never sends the PC's clipboard unless you tap.
 - **One small program.** The phone page is built into it, and it works with no internet connection.
@@ -59,7 +59,7 @@ beam [OPTIONS] [FILES]...
 | `beam --hotspot` | Windows: turn this PC into a Wi-Fi hotspot and connect the phone straight to it (see below). Handy in a desktop shortcut. |
 | `beam --help` | Show all options |
 
-### Connect the phone directly (Windows)
+### Connect the phone directly (Windows, experimental)
 
 On the page that opens in your PC's browser, pick **Direct to this PC** and click **Turn on this PC's hotspot**, or start Beam with `beam --hotspot`. Then, on the phone:
 
@@ -69,7 +69,7 @@ On the page that opens in your PC's browser, pick **Direct to this PC** and clic
 Files then go straight between phone and PC instead of through a router, so every byte crosses the air once instead of twice, and Beam asks Windows for the faster 5 GHz band. Beam uses your Windows hotspot's existing name and password, and turns the hotspot off again when it stops (if it turned it on).
 
 - **Speed depends on the band.** If the PC's own Wi-Fi is on 2.4 GHz, Windows may have to run the hotspot on 2.4 GHz too. Connecting the PC by cable, or to 5 GHz Wi-Fi, lets the hotspot use 5 GHz.
-- **Already on your phone's hotspot?** Then the PC and phone are already connected directly. For more speed, set the phone's hotspot to 5 GHz in its hotspot settings.
+- **Already on your phone's hotspot?** Then this can't work: the phone has to leave its own hotspot to join the PC's, which cuts off the connection the PC's hotspot shares. You're already connected directly anyway; for more speed, set the phone's hotspot to 5 GHz in its hotspot settings.
 - **Phone joined but Beam won't open?** Windows treats the hotspot as a public network. Allow Beam through Windows Firewall on **public** networks too.
 
 ### Share another folder without restarting

@@ -179,6 +179,23 @@
     color: var(--text);
     font: inherit;
   }
+  /* The clear button sits in the box's corner, so the text keeps clear of it. */
+  .clip-box { position: relative; }
+  .clip-box textarea { padding-right: 52px; }
+  .clear {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 40px;
+    height: 40px;
+    border: 0;
+    border-radius: 50%;
+    background: var(--border);
+    color: var(--text);
+    font: 1.4rem/1 system-ui, sans-serif;
+    cursor: pointer;
+  }
+  .clear[hidden] { display: none; }
   .buttons { display: flex; gap: 10px; margin-top: 10px; }
   .buttons > * { flex: 1; min-width: 0; }
   .act {
@@ -245,7 +262,10 @@
     <div class="head">
       <h2>Clipboard</h2>
     </div>
-    <textarea id="clip-text" placeholder="Type here, or long-press and tap Paste" aria-label="Clipboard text"></textarea>
+    <div class="clip-box">
+      <textarea id="clip-text" placeholder="Type here, or long-press and tap Paste" aria-label="Clipboard text"></textarea>
+      <button class="clear" id="clip-clear" type="button" aria-label="Clear the text" title="Clear" hidden>&times;</button>
+    </div>
     <div class="buttons">
       <button class="act" id="clip-send" type="button">Send to PC</button>
       <button class="act" id="clip-get" type="button">Get from PC</button>
@@ -576,6 +596,18 @@
   const MAX_CLIP_PIXELS = 32000000;
 
   const clipText = document.getElementById("clip-text");
+  const clipClear = document.getElementById("clip-clear");
+
+  // Shown only when there's something to clear.
+  function showClear() { clipClear.hidden = clipText.value === ""; }
+  clipText.addEventListener("input", showClear);
+  clipClear.addEventListener("click", () => {
+    clipText.value = "";
+    showClear();
+    clipSay("", "");
+    // Focused, so pasting something else is one long-press away.
+    clipText.focus();
+  });
   const clipSend = document.getElementById("clip-send");
   const clipGet = document.getElementById("clip-get");
   const clipCopy = document.getElementById("clip-copy");
@@ -607,6 +639,7 @@
     } else if (type.startsWith("text/")) {
       const text = await xhr.response.text();
       clipText.value = text;
+      showClear();
       hidePreview();
       clipSay(copyText(text) ? "Copied from the PC." : "Got it from the PC. Tap Copy to copy it.", "ok");
     } else if (type.startsWith("image/")) {
